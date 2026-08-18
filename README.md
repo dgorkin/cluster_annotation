@@ -201,6 +201,15 @@ Nothing costs money until you click a button, and every paid action asks you to 
    cannot appear in your output.
 3. **Runs a cohort review** over the finished set and flags cross-cluster problems.
 
+Paid work runs in the background, not inside the page. A build or a bulk run keeps going if you
+switch section, open another tab, or reload — its status shows as a banner in **AI insights** and a
+one-line indicator in the sidebar, with progress for per-cluster runs. Nothing else that costs
+money can start while one is in flight, so the same literature search can't be bought twice. A
+multi-cluster run offers **Stop**, which cancels the clusters that haven't started; a single call
+already in flight is paid for and is left to finish. If the app is restarted mid-run, the status
+reads `interrupted` rather than pretending to still be running — anything already written is kept,
+and re-running completes the rest.
+
 Then, optionally, escalate the clusters where the identity is genuinely uncertain to their own
 full literature search:
 
@@ -276,6 +285,8 @@ clusters you've labelled are included; toggle that to see what's outstanding.
 | `APITimeoutError` during generation | A research call is exceeding the HTTP timeout. Confirm nothing has changed the research call away from streaming |
 | "truncated at max_tokens … before writing the analysis" | `ai_insights.max_tokens` is too low for a search-heavy call — raise it to 32000. `doctor` warns below 16000 |
 | A run used a model you didn't pick | Check the **AI insights** tab: it states the models, effort and ceiling the next run will use. The sidebar choice is per dataset |
+| Not sure whether a build is still running | The sidebar shows an indicator whenever paid work is in flight, from any section; **AI insights** has the full banner. Status lives in `.cache/<name>/jobs/`, so it survives reloads |
+| A job says `interrupted` | The app was restarted while it ran. Whatever it finished writing was kept — re-run to complete the rest |
 | Two datasets overwriting each other | They share a `name:` — it drives the cache directory |
 | "Could not identify the cluster column" | The object's metadata has no column matching your cluster ids. Set `cell_counts.cluster_column`, or `cell_counts.tsv` to supply the counts directly |
 | `ncells` / `%cells` blank in the export | No Seurat object configured, or its counting failed — `./run_app.sh doctor` says which |
@@ -293,7 +304,7 @@ for t in tests/test_*.py; do ~/.conda/envs/cluster_annotation/bin/python $t; don
 
 ```
 config/dataset.template.yaml   copy this per dataset
-app/                           app.py (UI), data.py, pdf.py, insights.py (AI), store.py, export.py
+app/                           app.py (UI), data.py, pdf.py, insights.py (AI), store.py, export.py, jobs.py
 preprocess/export_markers.R    RDS -> marker tables + feature-plot page index
 preprocess/export_cell_counts.R  Seurat object -> cells per cluster (base R; no Seurat needed)
 scripts/generate_all.py        build primer + annotate every cluster + cohort review

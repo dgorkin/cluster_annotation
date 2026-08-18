@@ -18,6 +18,7 @@ import pdf as P
 import insights as I
 import store as S
 import export as E
+import jobs as J
 
 st.set_page_config(page_title="Cluster Annotation Browser", layout="wide")
 
@@ -76,7 +77,7 @@ def load_dataset(config_path: str, force: bool = False):
     load_cell_counts(cfg, force=force)
     aic = D.ai_insights_cfg(cfg)
     if aic["enabled"] and aic["auto_generate_on_load"] and I.api_key_available(cfg):
-        run_ai_generation(cfg, force=False)  # generate missing/stale clusters, cache to disk
+        start_ai_generation(cfg, force=False)  # background job; status in the AI insights tab
 
 
 def load_cell_counts(cfg, force: bool = False):
@@ -99,87 +100,195 @@ def load_cell_counts(cfg, force: bool = False):
     st.session_state.cell_counts = D.load_cell_counts(cfg)
 
 
-def run_ai_generation(cfg, force: bool):
-    """Generate AI insights for clusters needing them, with a progress bar. Never raises."""
+# --------------------------------------------------------------- paid AI work, as durable jobs
+# Every paid action runs through jobs.start, on a background thread with its state on disk. The
+# alternative (doing the work inline, inside st.spinner) tied a minutes-long, money-spending call
+# to one script run: switching section or reloading the page hid it completely, with no way to
+# tell whether it was still going.
+AI_JOBS = ("primer", "generate", "cohort", "reannotate")
+
+
+def start_primer_build(cfg) -> bool:
+    def work(_prog, _stop):
+        got = I.build_primer(cfg, force=True)
+        return (f"Primer built: {len(got.get('expected_cell_types') or [])} cell types, "
+                f"{len(got.get('references') or [])} references (~${I.record_cost(got):.2f}).")
+
+    return J.start(cfg, "primer", "Build reference primer", work)
+
+
+def start_ai_generation(cfg, force: bool, only: list[int] | None = None) -> bool:
+    """Annotate clusters that need it (or exactly `only`), as a background job."""
     clusters = st.session_state.clusters
     genes, motifs = st.session_state.genes, st.session_state.motifs
-    try:
-        todo = I.clusters_needing_insight(cfg, clusters, genes, motifs, force=force)
-    except Exception as e:
-        st.warning(f"AI insights: could not determine work ({e}).")
-        return
+    if only is None:
+        try:
+            todo = I.clusters_needing_insight(cfg, clusters, genes, motifs, force=force)
+        except Exception as e:  # noqa: BLE001
+            st.warning(f"AI insights: could not determine work ({e}).")
+            return False
+    else:
+        todo = list(only)
     if not todo:
-        return
-    prog = st.progress(0.0, text=f"AI insights: 0 / {len(todo)} clusters")
-    state = {"done": 0}
+        st.info("Every cluster already has a current annotation — nothing to generate.")
+        return False
 
-    def cb(_cluster, _err):
-        state["done"] += 1
-        prog.progress(state["done"] / len(todo),
-                      text=f"AI insights: {state['done']} / {len(todo)} clusters")
+    label = (f"Annotate cluster {todo[0]}" if len(todo) == 1
+             else f"Annotate {len(todo)} clusters")
 
-    try:
-        errors = I.generate_all(cfg, todo, genes, motifs, progress_cb=cb, force=True)
-    except Exception as e:  # missing key, network, etc. — never block the app
-        prog.empty()
-        st.warning(f"AI insights generation stopped: {e}")
-        return
-    prog.empty()
-    if errors:
-        st.warning(f"AI insights: {len(errors)} of {len(todo)} cluster(s) failed "
-                   "(open the AI insights tab and use **Regenerate original** to retry).")
-    spent = sum(I.record_cost(I.load_insight(cfg, c)) for c in todo)
-    if spent:
-        st.caption(f"Generated {len(todo) - len(errors)} cluster(s) · ~${spent:.2f} estimated "
-                   "(list prices, from the token counts the API reported).")
+    def work(prog, stop):
+        state = {"done": 0}
+
+        def cb(cluster, err):
+            state["done"] += 1
+            prog.update(done=state["done"],
+                        message=f"cluster {cluster}" + (f" failed: {err}" if err else " done"))
+
+        errors = I.generate_all(cfg, todo, genes, motifs, progress_cb=cb, force=True,
+                               should_stop=stop)
+        spent = sum(I.record_cost(I.load_insight(cfg, c)) for c in todo)
+        done = state["done"] - len(errors)
+        msg = f"Annotated {done} of {len(todo)} cluster(s) · ~${spent:.2f} estimated."
+        if errors:
+            msg += (f" {len(errors)} failed ({', '.join(str(c) for c, _ in errors[:6])}"
+                    f"{'…' if len(errors) > 6 else ''}) — retry from this tab.")
+        return msg
+
+    return J.start(cfg, "generate", label, work, total=len(todo), stoppable=len(todo) > 1)
 
 
-def run_reannotation(cfg, targets, review):
-    """Reannotate a list of clusters from the cohort critique, with a progress bar. Never raises."""
+def start_reannotation(cfg, targets, review) -> bool:
     if not targets:
-        return
+        return False
     genes, motifs = st.session_state.genes, st.session_state.motifs
-    prog = st.progress(0.0, text=f"Reannotating: 0 / {len(targets)} clusters")
-    state = {"done": 0}
+    targets = list(targets)
+    label = (f"Reannotate cluster {targets[0]}" if len(targets) == 1
+             else f"Reannotate {len(targets)} flagged clusters")
 
-    def cb(_cluster, _err):
-        state["done"] += 1
-        prog.progress(state["done"] / len(targets),
-                      text=f"Reannotating: {state['done']} / {len(targets)} clusters")
+    def work(prog, stop):
+        state = {"done": 0}
 
-    try:
-        errors = I.reannotate_flagged(cfg, targets, genes, motifs, review, progress_cb=cb)
-    except Exception as e:
-        prog.empty()
-        st.warning(f"Reannotation stopped: {e}")
+        def cb(cluster, err):
+            state["done"] += 1
+            prog.update(done=state["done"],
+                        message=f"cluster {cluster}" + (f" failed: {err}" if err else " done"))
+
+        errors = I.reannotate_flagged(cfg, targets, genes, motifs, review, progress_cb=cb,
+                                     should_stop=stop)
+        spent = sum(I.record_cost(I.load_reannotation(cfg, c)) for c in targets)
+        msg = (f"Reannotated {state['done'] - len(errors)} of {len(targets)} cluster(s) "
+               f"· ~${spent:.2f} estimated.")
+        if errors:
+            msg += f" {len(errors)} failed."
+        return msg
+
+    return J.start(cfg, "reannotate", label, work, total=len(targets),
+                   stoppable=len(targets) > 1)
+
+
+def start_cohort_review(cfg, clusters) -> bool:
+    def work(_prog, _stop):
+        rev = I.cohort_review(cfg, clusters, force=True)
+        flags = rev.get("flags") or []
+        return (f"Reviewed {len(clusters)} clusters: {len(flags)} flag(s) over "
+                f"{len(I.flagged_clusters(rev))} cluster(s) (~${I.record_cost(rev):.2f}).")
+
+    return J.start(cfg, "cohort", "Cohort review", work)
+
+
+@st.fragment(run_every=3)
+def sidebar_job_indicator(cfg):
+    """One line in the sidebar while paid work is in flight, visible from every section."""
+    kind = J.any_running(cfg, AI_JOBS)
+    if not kind:
         return
-    prog.empty()
-    if errors:
-        st.warning(f"Reannotation: {len(errors)} of {len(targets)} cluster(s) failed.")
-    spent = sum(I.record_cost(I.load_reannotation(cfg, c)) for c in targets)
-    if spent:
-        st.caption(f"Reannotated {len(targets) - len(errors)} cluster(s) · ~${spent:.2f} estimated.")
+    rec = J.read(cfg, kind) or {}
+    done, total = rec.get("done") or 0, rec.get("total")
+    counts = f" · {done}/{total}" if total else ""
+    # Plain st.* — a fragment cannot address st.sidebar directly; the caller supplies the sidebar
+    # as the active container instead.
+    st.warning(f"⏳ **{rec.get('label', kind)}** running{counts}\n\n"
+               "Details in **AI insights**. Safe to keep browsing.")
+
+
+@st.fragment(run_every=3)
+def job_banner(cfg):
+    """Status for whatever paid work is in flight (or last finished), refreshed every 3s.
+
+    In a fragment so the poll redraws just this box rather than re-running the whole page — which
+    would re-render the Tangram PDF every three seconds. A finished job triggers one full rerun so
+    the rest of the page (the primer summary, the overview counts) catches up.
+    """
+    for kind in AI_JOBS:
+        rec = J.read(cfg, kind)
+        if not rec:
+            continue
+        state, label = rec["state"], rec.get("label", kind)
+        if state == J.RUNNING:
+            done, total = rec.get("done") or 0, rec.get("total")
+            head = f"⏳ **{label}** — running since {rec.get('started_at', '?')}"
+            if total:
+                st.progress(min(done / total, 1.0), text=f"{head} · {done} / {total}")
+            else:
+                st.info(f"{head}. This makes one long call; there is nothing to show until it "
+                        "returns.")
+            st.caption(f"{rec.get('message', '')} · {rec.get('primary_model', '?')} · "
+                       "keeps running if you switch section or reload the page.")
+            if rec.get("stoppable") and not rec.get("stopping"):
+                if st.button("■ Stop after the clusters already in flight", key=f"stop_{kind}",
+                             help="Cancels the clusters that have not started. Calls already in "
+                                  "flight are paid for and are left to finish."):
+                    J.request_stop(cfg, kind)
+                    st.rerun(scope="fragment")
+            elif rec.get("stopping"):
+                st.caption("Stopping — waiting for the calls already in flight to return.")
+        else:
+            box = {J.DONE: st.success, J.FAILED: st.error}.get(state, st.warning)
+            box(f"**{label}** — {state}. {rec.get('message', '')}")
+            if st.button("Dismiss", key=f"dismiss_{kind}"):
+                J.clear(cfg, kind)
+                st.rerun()          # full rerun: the page behind this box is now stale
+            # One full rerun when a job lands, so the rest of the page reflects the new files.
+            seen = st.session_state.setdefault("_jobs_seen", set())
+            stamp = (kind, rec.get("finished_at"))
+            if stamp not in seen:
+                seen.add(stamp)
+                st.rerun()
 
 
 def confirm_action(label: str, prompt: str, key: str, *, disabled: bool = False,
                    help: str | None = None) -> bool:
     """A button that needs a second 'Yes, I'm sure' click before it fires.
 
-    Guards paid AI generation against accidental clicks. First click arms the action and shows the
-    `prompt` as an 'are you sure?' with Yes / Cancel; returns True only on the confirming click.
+    Guards paid AI generation against accidental clicks. Three states:
+
+      idle    the plain button
+      armed   the `prompt` as an 'are you sure?', with Yes / Cancel both live
+      firing  Yes has been clicked: both buttons render **disabled** and this returns True once
+
+    The firing state exists because the confirming click used to leave a live, primary-styled
+    "Yes, I'm sure" on screen while the paid work ran — inviting a second click on an action that
+    costs money. Clicking Yes now reruns immediately into a cold row, and only then is the work
+    launched, so there is no live button to double-click and no doubt about whether the first
+    click registered.
     """
-    armed = f"_armed_{key}"
+    armed, firing = f"_armed_{key}", f"_firing_{key}"
+    if st.session_state.pop(firing, False):
+        st.warning(prompt)
+        c1, c2 = st.columns(2)
+        c1.button("⏳ Starting…", key=f"{key}__yes_cold", disabled=True, width="stretch")
+        c2.button("Cancel", key=f"{key}__no_cold", disabled=True, width="stretch")
+        return True
     if st.session_state.get(armed):
         st.warning(prompt)
         cy, cn = st.columns(2)
-        go = cy.button("✅ Yes, I'm sure", key=f"{key}__yes", type="primary",
-                       width="stretch")
+        if cy.button("✅ Yes, I'm sure", key=f"{key}__yes", type="primary", width="stretch"):
+            st.session_state[armed] = False
+            st.session_state[firing] = True
+            st.rerun()
         if cn.button("Cancel", key=f"{key}__no", width="stretch"):
             st.session_state[armed] = False
             st.rerun()
-        if go:
-            st.session_state[armed] = False
-            return True
         return False
     if st.button(label, key=f"{key}__start", disabled=disabled, help=help,
                  width="stretch"):
@@ -621,6 +730,8 @@ if "cfg" not in st.session_state:
 cfg = st.session_state.cfg
 clusters = st.session_state.clusters
 st.sidebar.success(f"**{cfg['name']}** · res {cfg.get('resolution','?')} · {len(clusters)} clusters")
+with st.sidebar:                  # a fragment writes to the active container, and
+    sidebar_job_indicator(cfg)    # cannot address st.sidebar itself
 
 # Cluster picker, labelled with state (decision / AI call / flags / stars / notes) so progress
 # across 34 clusters is visible instead of being 34 bare integers.
@@ -1063,6 +1174,12 @@ elif section == "AI insights":
                 "Raise `ai_insights.max_tokens` to 32000 in the dataset config.")
         st.caption(f"💰 {I.format_dataset_cost(cfg, clusters)}")
 
+        # Anything in flight is shown here first, and blocks the other paid buttons: two runs on
+        # one dataset would race on the same cache files, and it is never what you meant to buy.
+        job_banner(cfg)
+        _busy = J.any_running(cfg, AI_JOBS)
+        _busy_help = (f"Waiting for the running job ({_busy}) to finish." if _busy else None)
+
         # In primer mode the dataset's reference sheet is the prerequisite for every per-cluster
         # annotation, so it needs a way in from the UI — not just the command-line runner.
         if aic["research_mode"] == "primer":
@@ -1088,16 +1205,9 @@ elif section == "AI insights":
                     "call — the largest single call in the pipeline. Rebuilding it changes the "
                     "evidence every cluster is judged against, so all per-cluster annotations "
                     "will read as needing regeneration.",
-                    key="primer_build"):
-                with st.spinner("Researching the literature for this dataset… (a few minutes)"):
-                    try:
-                        got = I.build_primer(cfg, force=True)
-                        st.success(
-                            f"Primer built: {len(got.get('expected_cell_types') or [])} cell "
-                            f"types, {len(got.get('references') or [])} references "
-                            f"(~${I.record_cost(got):.2f}).")
-                    except Exception as exc:
-                        st.error(f"Primer build failed: {exc}")
+                    key="primer_build", disabled=bool(_busy), help=_busy_help):
+                if start_primer_build(cfg):
+                    st.rerun()      # straight into the running banner
             with st.expander("What the primer contains"):
                 if primer is None:
                     st.caption("Nothing yet.")
@@ -1120,29 +1230,25 @@ elif section == "AI insights":
                 f"Regenerate original — cluster {cluster}",
                 f"Regenerate the AI annotation for cluster {cluster}? This makes a paid API call and "
                 "overwrites the current annotation (a timestamped backup is kept).",
-                key="ai_regen_one"):
-            with st.spinner(f"Generating insight for cluster {cluster}…"):
-                try:
-                    I.generate_one(cfg, cluster, genes_df, motifs_df, force=True)
-                except Exception as e:
-                    st.error(f"Generation failed: {e}")
+                key="ai_regen_one", disabled=bool(_busy), help=_busy_help):
+            if start_ai_generation(cfg, force=True, only=[cluster]):
+                st.rerun()
         reannot_help = None if review is not None else "Run a cohort review first (Cohort review tab)."
         if confirm_action(
                 "Reannotate (use cohort review)",
                 f"Reannotate cluster {cluster} using the cohort review? This makes a paid API call "
                 "and writes a separate revised annotation (the original is kept).",
-                key="ai_reannot", disabled=(review is None), help=reannot_help):
-            with st.spinner(f"Reannotating cluster {cluster} from the cohort critique…"):
-                try:
-                    I.generate_reannotation(cfg, cluster, genes_df, motifs_df, review)
-                except Exception as e:
-                    st.error(f"Reannotation failed: {e}")
+                key="ai_reannot", disabled=(review is None or bool(_busy)),
+                help=reannot_help or _busy_help):
+            if start_reannotation(cfg, [cluster], review):
+                st.rerun()
         if confirm_action(
                 "Regenerate ALL originals",
                 f"Regenerate ALL {len(clusters)} cluster annotations? This re-runs the entire paid "
                 "AI pass and overwrites every current annotation (each backed up first).",
-                key="ai_regen_all"):
-            run_ai_generation(cfg, force=True)
+                key="ai_regen_all", disabled=bool(_busy), help=_busy_help):
+            if start_ai_generation(cfg, force=True):
+                st.rerun()
 
         st.markdown("### 1 · Original annotation")
         rec = I.load_insight(cfg, cluster)
@@ -1207,16 +1313,17 @@ elif section == "Cohort review":
         st.caption(f"A 'head' pass that reviews all {n_done}/{len(clusters)} generated cluster "
                    "annotations together — flags over-split/redundant clusters, inconsistencies, "
                    "and missing expected cell types. One call, no web search.")
+        job_banner(cfg)
+        _busy = J.any_running(cfg, AI_JOBS)
+        _busy_help = (f"Waiting for the running job ({_busy}) to finish." if _busy else None)
         if confirm_action(
                 "Run cohort review",
                 f"Run the cohort review over all {n_done} generated annotations? This makes a paid "
                 "API call.",
-                key="cohort_run", disabled=(n_done == 0)):
-            with st.spinner(f"Reviewing {n_done} cluster annotations…"):
-                try:
-                    I.cohort_review(cfg, clusters, force=True)
-                except Exception as e:
-                    st.error(f"Cohort review failed: {e}")
+                key="cohort_run", disabled=(n_done == 0 or bool(_busy)),
+                help=_busy_help):
+            if start_cohort_review(cfg, clusters):
+                st.rerun()
         if n_done == 0:
             st.info("Generate per-cluster insights first (AI insights tab), then run the review.")
         rev = I.load_cohort_review(cfg)
@@ -1234,8 +1341,10 @@ elif section == "Cohort review":
                         "per cluster; each original is kept and a separate reannotation written.",
                         key="reannot_all",
                         help="Keeps each original; writes a separate reannotation per cluster. "
-                             "Review all three (original · flags · reannotation) in the AI insights tab."):
-                    run_reannotation(cfg, flagged, rev)
+                             "Review all three (original · flags · reannotation) in the AI insights tab.",
+                        disabled=bool(_busy)):
+                    if start_reannotation(cfg, flagged, rev):
+                        st.rerun()
             render_cohort(rev)
         elif n_done:
             st.info("No cohort review yet. Click **Run cohort review**.")

@@ -22,7 +22,7 @@ import re
 import shutil
 import stat
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -909,11 +909,16 @@ def generate_one(cfg: dict, cluster: int, genes: pd.DataFrame, motifs: pd.DataFr
 
 def generate_all(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.DataFrame,
                  progress_cb: Optional[Callable[[int, Optional[str]], None]] = None,
-                 force: bool = True) -> list[tuple[int, str]]:
+                 force: bool = True,
+                 should_stop: Optional[Callable[[], bool]] = None) -> list[tuple[int, str]]:
     """Generate insights for `clusters` concurrently. Returns a list of (cluster, error) failures.
 
     progress_cb(cluster, error) is invoked from the calling thread as each cluster completes
     (error is None on success) — safe to update Streamlit widgets from it.
+
+    should_stop() is polled as clusters complete: when it turns true, clusters that have not
+    started yet are cancelled. Calls already in flight are paid for and are left to finish, so
+    stopping bounds future spend rather than pretending to undo the current one.
     """
     aic = D.ai_insights_cfg(cfg)
     # Load the primer once and pass it down: 34 workers each re-reading and re-hashing it is
@@ -928,11 +933,16 @@ def generate_all(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.DataFrame,
             try:
                 fut.result()
                 err = None
+            except CancelledError:
+                continue          # never started; not a failure worth reporting
             except Exception as e:  # one cluster failing must not kill the batch
                 err = str(e)
                 errors.append((c, err))
             if progress_cb:
                 progress_cb(c, err)
+            if should_stop and should_stop():
+                for pending in futs:
+                    pending.cancel()   # no-op on anything already running
     return errors
 
 
@@ -1202,9 +1212,13 @@ def format_dataset_cost(cfg: dict, clusters) -> str:
 
 
 def reannotate_flagged(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.DataFrame, review: dict,
-                       progress_cb: Optional[Callable[[int, Optional[str]], None]] = None
+                       progress_cb: Optional[Callable[[int, Optional[str]], None]] = None,
+                       should_stop: Optional[Callable[[], bool]] = None
                        ) -> list[tuple[int, str]]:
-    """Reannotate each cluster in `clusters` concurrently. Returns (cluster, error) failures."""
+    """Reannotate each cluster in `clusters` concurrently. Returns (cluster, error) failures.
+
+    `should_stop` behaves as in generate_all: not-yet-started clusters are cancelled.
+    """
     aic = D.ai_insights_cfg(cfg)
     errors: list[tuple[int, str]] = []
     with ThreadPoolExecutor(max_workers=aic["max_workers"]) as ex:
@@ -1214,9 +1228,14 @@ def reannotate_flagged(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.Data
             try:
                 fut.result()
                 err = None
+            except CancelledError:
+                continue
             except Exception as e:
                 err = str(e)
                 errors.append((c, err))
             if progress_cb:
                 progress_cb(c, err)
+            if should_stop and should_stop():
+                for pending in futs:
+                    pending.cancel()
     return errors
