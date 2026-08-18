@@ -59,6 +59,29 @@ featureplot:
     sort_primary: [p_val_adj, avg_diff]       # single list, no separator
     separator: null
 
+# ---------------------------------------------------------------- cells per cluster (optional)
+# `ncells` and `%cells` in the export are counted from the Seurat object the clusters came from,
+# once per dataset, during the same preprocessing step that exports the marker tables. The result
+# is cached in .cache/<name>/cluster_cells.tsv; a value you type into the form always wins.
+#
+# Reading a large object costs tens of seconds and several GB of RAM, so do it up front if you
+# would rather not wait on a page load:  ./run_app.sh counts config/mydataset.yaml
+cell_counts:
+  seurat_object: null       # .rds or .rdata; the extension is not trusted, the file is sniffed
+  cluster_column: auto      # metadata column with the cluster ids. "auto" picks the column whose
+                            # values match the marker tables' clusters exactly — which verifies
+                            # itself, unlike guessing by name. Name it explicitly if auto fails.
+  object_var: auto          # only for save()-format .rdata holding several objects
+  auto: true                # false = never read the object on load; use ./run_app.sh counts
+  tsv: null                 # already have the numbers? point at a cluster,ncells[,pct_cells] TSV
+                            # and the object is never read
+
+# ---------------------------------------------------------------- annotation output (optional)
+# A TSV rewritten in place with the same 13 columns as the xlsx export — a fixed path a downstream
+# script can keep reading. `{name}` and `{date}` are substituted. Leave unset to name it in the app
+# instead (All clusters -> Export). When set, the app rewrites it every time you save an annotation.
+output_tsv: null            # e.g. annotations/{name}_annotations.tsv
+
 # ---------------------------------------------------------------- biological context (important)
 # Describe the sample in prose: species, developmental stage or age, tissue, assay, and any
 # caveats. This is the foundation for everything the AI produces — the reference sheet it builds,

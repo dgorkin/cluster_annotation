@@ -13,6 +13,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "app"))
 
+import data as D     # noqa: E402
 import export as E    # noqa: E402
 import insights as I  # noqa: E402
 import store as S     # noqa: E402
@@ -184,6 +185,80 @@ def test_export_of_an_empty_store_is_a_valid_empty_sheet():
         path, n = E.write_xlsx(cfg, [0, 1], genes, motifs, out_dir=tmp)
         assert n == 0
         assert list(pd.read_excel(path).columns) == E.EXPORT_COLUMNS
+
+
+def test_cell_counts_prefill_ncells_and_pct_when_the_user_typed_none():
+    """The counts are measurements: exporting blanks when we know them is just lost information."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, genes, motifs = _fixture(tmp)
+        (Path(tmp) / "t").mkdir(parents=True, exist_ok=True)
+        D.cell_counts_path(cfg).write_text("cluster\tncells\tpct_cells\n0\t2834\t0.0536\n")
+        S.set_annotation(cfg, 0, {"annot_type": "x"})
+        row = E.build_table(cfg, [0], genes, motifs).loc[0]
+        assert row["ncells"] == 2834 and abs(row["%cells"] - 0.0536) < 1e-12
+
+        # A typed value is a decision and must win over the computed one.
+        S.set_annotation(cfg, 0, {"ncells": 99, "pct_cells": 0.5})
+        row = E.build_table(cfg, [0], genes, motifs).loc[0]
+        assert row["ncells"] == 99 and row["%cells"] == 0.5
+
+
+def test_cell_counts_derives_pct_when_the_file_only_has_counts():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, _, _ = _fixture(tmp)
+        D.cell_counts_path(cfg).write_text("cluster\tncells\n0\t30\n1\t70\n")
+        got = D.load_cell_counts(cfg)
+        assert got[0]["ncells"] == 30 and abs(got[1]["pct_cells"] - 0.7) < 1e-12
+
+
+def test_missing_or_broken_cell_counts_are_not_fatal():
+    """Counts are a convenience; a malformed file must not stop the app or the export."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, genes, motifs = _fixture(tmp)
+        assert D.load_cell_counts(cfg) == {}          # nothing written yet
+        D.cell_counts_path(cfg).write_text("not\ta\tcounts\tfile\n")
+        assert D.load_cell_counts(cfg) == {}
+        S.set_annotation(cfg, 0, {"annot_type": "x"})
+        assert pd.isna(E.build_table(cfg, [0], genes, motifs).loc[0, "ncells"])
+
+
+def test_tsv_export_matches_the_xlsx_content_and_header():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, genes, motifs = _fixture(tmp)
+        S.set_annotation(cfg, 0, {"annot_type": "Forebrain progenitors", "annot_abbrev": "Fb",
+                                  "ncells": 3095, "pct_cells": 0.0508393836854036})
+        S.set_markers(cfg, 0, "gene", {"Six3", "Lhx2"}, {"Six3", "Lhx2"})
+        path, n = E.write_tsv(cfg, [0], genes, motifs, out_path=str(Path(tmp) / "out.tsv"))
+        assert path.exists() and n == 1
+        back = pd.read_csv(path, sep="\t")
+        assert list(back.columns) == E.EXPORT_COLUMNS
+        assert back.loc[0, "key_marker_genes"] == "Six3,Lhx2"
+        assert abs(back.loc[0, "%cells"] - 0.0508393836854036) < 1e-12
+        # Blank, not the string "nan" — read.delim in R has to see NA.
+        assert "nan" not in path.read_text()
+
+
+def test_tsv_path_prefers_explicit_then_config_then_a_default():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, _, _ = _fixture(tmp)
+        assert E.tsv_path(cfg).suffix == ".tsv"
+        assert E.tsv_path(cfg).parent == Path(tmp)
+        cfg["output_tsv"] = "{name}_annotations.tsv"
+        assert E.tsv_path(cfg).name == "t_annotations.tsv"
+        assert E.tsv_path(cfg, str(Path(tmp) / "explicit.tsv")).name == "explicit.tsv"
+
+
+def test_tsv_rewrites_the_same_path_rather_than_dating_a_new_one():
+    """The point of output_tsv is one file a downstream script keeps reading."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, genes, motifs = _fixture(tmp)
+        cfg["output_tsv"] = "{name}_annotations.tsv"
+        S.set_annotation(cfg, 0, {"annot_type": "first"})
+        p1, _ = E.write_tsv(cfg, [0], genes, motifs)
+        S.set_annotation(cfg, 0, {"annot_type": "second"})
+        p2, _ = E.write_tsv(cfg, [0], genes, motifs)
+        assert p1 == p2
+        assert pd.read_csv(p2, sep="\t").loc[0, "annot_type"] == "second"
 
 
 if __name__ == "__main__":

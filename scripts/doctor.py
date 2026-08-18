@@ -117,6 +117,40 @@ def check_config(path: Path) -> None:
         report(WARN, "no marker cache yet",
                "First load will run preprocess/export_markers.R via Rscript.")
 
+    # Cells per cluster: the object is optional, but a configured-and-missing one is a real fault,
+    # and a stale cache means the next load pays the read again.
+    cc = D.cell_counts_cfg(cfg)
+    counts = D.load_cell_counts(cfg)
+    if cc["tsv"]:
+        p = D.resolve(cfg, cc["tsv"])
+        report(OK if p.exists() else FAIL, f"cell_counts.tsv ({len(counts)} clusters)",
+               str(p) if not p.exists() else "")
+    elif not cc["seurat_object"]:
+        report(WARN, "no Seurat object configured",
+               "ncells / %cells will be blank in the export unless you type them. Set "
+               "cell_counts.seurat_object (or cell_counts.tsv).")
+    else:
+        obj = D.resolve(cfg, cc["seurat_object"])
+        if not obj.exists():
+            report(FAIL, "cell_counts.seurat_object", str(obj))
+        elif counts and not D.cell_counts_needed(cfg):
+            meta = D.cell_counts_meta(cfg)
+            report(OK, f"cells per cluster cached ({len(counts)} clusters, "
+                       f"{sum(v['ncells'] for v in counts.values()):,} cells"
+                       + (f", column '{meta['cluster_column']}'" if meta.get("cluster_column")
+                          else "") + ")")
+        else:
+            report(WARN, "cells per cluster not counted yet"
+                         + (" (cache is older than the object)" if counts else ""),
+                   f"Next load reads {obj.name} ({obj.stat().st_size / 1024**3:.1f} GB), which "
+                   "takes tens of seconds. Do it now with:\n"
+                   f"      ./run_app.sh counts {path}")
+
+    if cfg.get("output_tsv"):
+        import export as E
+        report(OK, f"output_tsv -> {E.tsv_path(cfg)}",
+               "Rewritten every time an annotation is saved.")
+
     for entry in D.other_annotations(cfg):
         p = D.other_pdf(cfg, entry, 0)
         report(OK if p.exists() else WARN,
@@ -127,6 +161,13 @@ def check_config(path: Path) -> None:
                f"structuring {aic['structuring_model']}")
     report(OK, f"effort {aic['effort']}, max_uses {aic['web_search_max_uses']}, "
                f"caching {aic['prompt_caching']}, workers {aic['max_workers']}")
+    # A low ceiling doesn't fail until a paid call has already searched the literature and then
+    # truncated with nothing written — worth flagging before that happens.
+    report(OK if aic["max_tokens"] >= 16000 else WARN, f"max_tokens {aic['max_tokens']:,}",
+           "" if aic["max_tokens"] >= 16000 else
+           "Thinking, web search and the written analysis share this budget. A search-heavy "
+           "primer can spend it all before writing anything and fail with 'truncated at "
+           "max_tokens'. 32000 is the recommended value.")
 
     import insights as I
     unpriced = [m for m in (aic["primary_model"], aic["fallback_model"], aic["structuring_model"])

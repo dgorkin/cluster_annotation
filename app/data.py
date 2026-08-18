@@ -12,6 +12,7 @@ import yaml
 from pdf import page_texts
 
 REQUIRED_OUTPUTS = ("gene_markers.tsv.gz", "motif_markers.tsv.gz", "feature_plot_index.tsv")
+CELL_COUNTS_FILE = "cluster_cells.tsv"
 
 # ---------------------------------------------------------------- UI preferences
 # Project-level, not per-dataset: the render DPI and image width are properties of the screen you
@@ -99,6 +100,12 @@ def _needs_preprocess(cfg: dict) -> bool:
     return newest_src > oldest_out
 
 
+def rscript_bin(cfg: dict) -> str:
+    """The Rscript to run the preprocessing scripts with. Both are base-R only, so the system one
+    is normally right; `rscript:` in the config points at a specific install if needed."""
+    return str(cfg.get("rscript") or "Rscript")
+
+
 def ensure_preprocessed(cfg: dict, force: bool = False) -> Path:
     """Run the R export if outputs are missing/stale. Returns the cache dir."""
     cd = cache_dir(cfg)
@@ -109,7 +116,7 @@ def ensure_preprocessed(cfg: dict, force: bool = False) -> Path:
     motif_topn = str(fp.get("motif", {}).get("topn", 30))
     gene_sep = str(fp.get("gene", {}).get("separator", "Gapdh"))
     script = Path(cfg["_root"]) / "preprocess" / "export_markers.R"
-    cmd = ["Rscript", str(script),
+    cmd = [rscript_bin(cfg), str(script),
            str(resolve(cfg, cfg["markers_rds"])),
            str(resolve(cfg, cfg["motif_markers_rds"])),
            str(cd), gene_topn, motif_topn, gene_sep]
@@ -117,6 +124,118 @@ def ensure_preprocessed(cfg: dict, force: bool = False) -> Path:
     if res.returncode != 0:
         raise RuntimeError(f"export_markers.R failed:\n{res.stderr}\n{res.stdout}")
     return cd
+
+
+# ---------------------------------------------------------------- cells per cluster
+# ncells and %cells are two of the export columns, and typing 42 pairs of them by hand from a
+# Seurat object is exactly the kind of transcription a tool should do. They are computed once per
+# dataset, in the same preprocessing step as the marker tables, and cached.
+CELL_COUNTS_DEFAULTS = {
+    "seurat_object": None,    # .rds / .rdata holding the object the clusters came from
+    "cluster_column": "auto",  # metadata column with the cluster ids; auto = match the markers
+    "object_var": "auto",     # variable name inside a save()-format .rdata
+    "auto": True,             # compute during preprocessing when the cache is missing/stale
+    "tsv": None,              # a precomputed cluster,ncells[,pct_cells] TSV — skips R entirely
+}
+
+
+def cell_counts_cfg(cfg: dict) -> dict:
+    """Cell-count settings merged over the defaults.
+
+    `seurat_object` falls back to the top-level `seurat_object` / `seurat_rdata` keys, so a config
+    that already names the object doesn't have to repeat the path.
+    """
+    merged = dict(CELL_COUNTS_DEFAULTS)
+    merged.update(cfg.get("cell_counts") or {})
+    if not merged["seurat_object"]:
+        merged["seurat_object"] = cfg.get("seurat_object") or cfg.get("seurat_rdata")
+    return merged
+
+
+def cell_counts_path(cfg: dict) -> Path:
+    """Where the computed counts live — the override TSV if one is configured, else the cache."""
+    cc = cell_counts_cfg(cfg)
+    return resolve(cfg, cc["tsv"]) if cc["tsv"] else cache_dir(cfg) / CELL_COUNTS_FILE
+
+
+def cell_counts_needed(cfg: dict) -> bool:
+    """True when the counts could be computed but haven't been (or are older than the object)."""
+    cc = cell_counts_cfg(cfg)
+    if cc["tsv"] or not cc["seurat_object"]:
+        return False            # supplied directly, or nothing to compute from
+    obj = resolve(cfg, cc["seurat_object"])
+    if not obj.exists():
+        return False
+    out = cache_dir(cfg) / CELL_COUNTS_FILE
+    return not out.exists() or os.path.getmtime(out) < os.path.getmtime(obj)
+
+
+def ensure_cell_counts(cfg: dict, force: bool = False,
+                       expected: list[int] | None = None) -> Path | None:
+    """Count cells per cluster from the Seurat object, unless that is already done.
+
+    Returns the counts file, or None when the dataset has no object configured. Raises with the R
+    script's own message on failure — a wrong cluster column is worth stopping for, since silently
+    exporting counts from the wrong grouping would be worse than no counts at all.
+    """
+    cc = cell_counts_cfg(cfg)
+    if cc["tsv"]:
+        p = resolve(cfg, cc["tsv"])
+        if not p.exists():
+            raise RuntimeError(f"cell_counts.tsv does not exist: {p}")
+        return p
+    if not cc["seurat_object"]:
+        return None
+    obj = resolve(cfg, cc["seurat_object"])
+    if not obj.exists():
+        raise RuntimeError(f"Seurat object not found: {obj}")
+    cd = cache_dir(cfg)
+    out = cd / CELL_COUNTS_FILE
+    if not force and not cell_counts_needed(cfg):
+        return out if out.exists() else None
+    script = Path(cfg["_root"]) / "preprocess" / "export_cell_counts.R"
+    cmd = [rscript_bin(cfg), str(script), str(obj), str(cd),
+           str(cc["cluster_column"] or "auto"), str(cc["object_var"] or "auto"),
+           ",".join(str(c) for c in (expected or []))]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"export_cell_counts.R failed:\n{res.stderr}\n{res.stdout}")
+    return out
+
+
+def load_cell_counts(cfg: dict) -> dict[int, dict]:
+    """{cluster: {'ncells': int, 'pct_cells': float}}, or {} if counts aren't available.
+
+    Never raises: counts are a convenience that prefills two export columns, so a malformed file
+    must not stop the app from opening. `pct_cells` is derived when the file omits it.
+    """
+    path = cell_counts_path(cfg)
+    try:
+        df = pd.read_csv(path, sep="\t")
+    except (OSError, ValueError, pd.errors.ParserError):
+        return {}
+    if "cluster" not in df.columns or "ncells" not in df.columns:
+        return {}
+    df = df.dropna(subset=["cluster", "ncells"])
+    if "pct_cells" not in df.columns:
+        total = df["ncells"].sum()
+        df["pct_cells"] = df["ncells"] / total if total else None
+    out = {}
+    for r in df.itertuples():
+        try:
+            out[int(r.cluster)] = {"ncells": int(r.ncells), "pct_cells": float(r.pct_cells)}
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def cell_counts_meta(cfg: dict) -> dict:
+    """What the counts were computed from (object, column, total) — for the UI caption. {} if
+    unknown, e.g. when the counts came from a hand-supplied TSV."""
+    try:
+        return json.loads((cache_dir(cfg) / "cluster_cells.meta.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 # ---------------------------------------------------------------- marker tables
@@ -162,8 +281,8 @@ KNOWN_MODELS = [
 AI_INSIGHTS_DEFAULTS = {
     "enabled": True,
     "auto_generate_on_load": False,  # never auto-spend on load; generation is button-only + confirmed
-    "primary_model": "claude-opus-4-8",     # Fable 5 reroutes on "bio" content for this dataset
-    "fallback_model": "claude-opus-4-7",    # distinct fallback if the primary refuses/reroutes
+    "primary_model": "claude-opus-5",       # current Opus; thinking is on by default here
+    "fallback_model": "claude-opus-4-8",    # used automatically if the primary declines/reroutes
     "structuring_model": "claude-haiku-4-5",  # mechanical reformat into the schema
     "effort": "high",
     "top_n_genes": 30,

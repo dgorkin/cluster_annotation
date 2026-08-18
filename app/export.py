@@ -1,10 +1,14 @@
-"""Export the annotation of record to an xlsx matching the E9_annotations template.
+"""Export the annotation of record to an xlsx (or TSV) matching the annotation template.
 
 The 13 columns come from three places, deliberately not duplicated in storage:
 
   annot_* / reference_omg_type / refs / ncells / %cells   the `annotations` table (user's decision)
   key_marker_genes / select_marker_motifs                 starred markers (the ★ checkboxes)
   comments                                                the `comments` table, joined
+
+ncells / %cells fall back to the counts computed from the Seurat object during preprocessing when
+the user hasn't recorded their own — they are measurements, not judgements, so there is nothing to
+decide and no reason to make anyone retype 42 of them.
 
 Anything the user hasn't filled in is left blank rather than guessed — the AI insight is offered
 as a *prefill* in the UI, so what lands here is what the user accepted, not what a model proposed.
@@ -57,11 +61,13 @@ def build_table(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.DataFrame,
     """
     annotations = S.all_annotations(cfg)
     labelled = S.annotated_clusters(cfg)
+    counts = D.load_cell_counts(cfg)
     rows = []
     for c in clusters:
         if only_annotated and c not in labelled:
             continue
         a = annotations.get(c, {})
+        n = counts.get(c, {})
         rows.append({
             "cluster": c,
             "annot_origin": a.get("annot_origin") or "",
@@ -73,8 +79,9 @@ def build_table(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.DataFrame,
             "key_marker_genes": _sorted_stars(cfg, c, "gene", genes),
             "select_marker_motifs": _sorted_stars(cfg, c, "motif", motifs),
             "refs": a.get("refs") or "",
-            "ncells": a.get("ncells"),
-            "%cells": a.get("pct_cells"),
+            # A saved value always wins; the computed count fills the gap when there isn't one.
+            "ncells": a.get("ncells") if a.get("ncells") is not None else n.get("ncells"),
+            "%cells": a.get("pct_cells") if a.get("pct_cells") is not None else n.get("pct_cells"),
             "comments": _comments_text(cfg, c),
         })
     df = pd.DataFrame(rows, columns=EXPORT_COLUMNS)
@@ -114,6 +121,24 @@ def export_path(cfg: dict, out_dir: Optional[str] = None) -> Path:
     return d / f"{cfg['name']}_annotations_{stamp}.xlsx"
 
 
+def tsv_path(cfg: dict, out_path: Optional[str] = None) -> Path:
+    """Where the TSV export goes: an explicit path, else `output_tsv:` from the config, else a
+    dated file beside the annotation DB.
+
+    A configured path may contain `{name}` and `{date}`. Unlike the xlsx, the default has no date
+    in it when the config names the file — the point of `output_tsv` is one file that a downstream
+    script can keep reading, so a new filename every day would defeat it.
+    """
+    raw = out_path or cfg.get("output_tsv")
+    if not raw:
+        return export_path(cfg).with_suffix(".tsv")
+    raw = str(raw).format(name=cfg.get("name", "dataset"),
+                          date=pd.Timestamp.now().strftime("%Y%m%d"))
+    p = D.resolve(cfg, raw)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def write_xlsx(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.DataFrame,
                out_dir: Optional[str] = None, only_annotated: bool = True) -> tuple[Path, int]:
     """Write the export and return (path, row_count). Sheet name matches the template's."""
@@ -127,4 +152,19 @@ def write_xlsx(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.DataFrame,
             widest = max([len(str(col))] + [len(str(v)) for v in df[col].head(200) if v is not None])
             ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = min(widest + 2, 60)
         ws.freeze_panes = "A2"
+    return path, len(df)
+
+
+def write_tsv(cfg: dict, clusters, genes: pd.DataFrame, motifs: pd.DataFrame,
+              out_path: Optional[str] = None, only_annotated: bool = True) -> tuple[Path, int]:
+    """Write the same 13 columns as the xlsx to a tab-separated file; return (path, row_count).
+
+    Same content, plainer container: a TSV is what a downstream R or Python script wants, and it is
+    what the app can rewrite on every save without anyone having to remember to press Export.
+    Missing values are written empty rather than as "nan", so `read.delim` sees NA.
+    """
+    df = build_table(cfg, clusters, genes, motifs, only_annotated=only_annotated)
+    path = tsv_path(cfg, out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, sep="\t", index=False, na_rep="")
     return path, len(df)

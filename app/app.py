@@ -4,6 +4,7 @@ Run:  streamlit run app/app.py --server.port 8501 --server.address 127.0.0.1
 Then: ssh -L 8501:localhost:8501 <server>   and open http://localhost:8501
 """
 from __future__ import annotations
+import json
 import os
 import sys
 from pathlib import Path
@@ -72,9 +73,30 @@ def load_dataset(config_path: str, force: bool = False):
     st.session_state.feat_idx = D.load_feature_index(cfg)
     st.session_state.tangram = D.tangram_index(cfg)
     st.session_state.clusters = D.clusters(cfg)
+    load_cell_counts(cfg, force=force)
     aic = D.ai_insights_cfg(cfg)
     if aic["enabled"] and aic["auto_generate_on_load"] and I.api_key_available(cfg):
         run_ai_generation(cfg, force=False)  # generate missing/stale clusters, cache to disk
+
+
+def load_cell_counts(cfg, force: bool = False):
+    """Put ncells / %cells per cluster in session state, computing them first if needed.
+
+    Part of loading rather than a button, because the numbers are a property of the dataset: once
+    computed they are cached until the object changes. The read of the object is the expensive bit
+    (tens of seconds and several GB for a whole-embryo multiome), hence the explicit spinner and
+    the never-raise contract — a dataset whose object is missing or ambiguous must still open.
+    """
+    # `auto: false` opts out of ever reading the object on load — the CLI (./run_app.sh counts)
+    # and the Recount button still work, they pass force.
+    if force or (D.cell_counts_cfg(cfg)["auto"] and D.cell_counts_needed(cfg)):
+        try:
+            with st.spinner("Counting cells per cluster from the Seurat object — reads a large "
+                            "file, usually under a minute…"):
+                D.ensure_cell_counts(cfg, force=force, expected=st.session_state.clusters)
+        except Exception as exc:  # noqa: BLE001 - counts are a convenience, not a prerequisite
+            st.warning(f"Could not count cells per cluster: {exc}")
+    st.session_state.cell_counts = D.load_cell_counts(cfg)
 
 
 def run_ai_generation(cfg, force: bool):
@@ -180,8 +202,8 @@ def _page_count(path: str, _mtime: float) -> int:
     return P.page_count(path)
 
 
-def _state_stamp(cfg, clusters) -> tuple[float, float]:
-    """(annotation-db mtime, newest insight mtime) — the cache key for the overview.
+def _state_stamp(cfg, clusters) -> tuple[float, float, float]:
+    """(annotation-db mtime, newest insight mtime, cell-counts mtime) — the overview's cache key.
 
     The insight directory's own mtime is not enough: regenerating rewrites existing files in
     place, which does not touch the directory. Stat the files instead.
@@ -195,11 +217,16 @@ def _state_stamp(cfg, clusters) -> tuple[float, float]:
                   default=0.0)
     except OSError:
         ins = 0.0
-    return db, ins
+    try:
+        counts = D.cell_counts_path(cfg).stat().st_mtime
+    except OSError:
+        counts = 0.0
+    return db, ins, counts
 
 
 @st.cache_data(show_spinner=False)
-def cluster_overview(_cfg, _clusters, _name: str, _db_mtime: float, _ins_mtime: float):
+def cluster_overview(_cfg, _clusters, _name: str, _db_mtime: float, _ins_mtime: float,
+                     _counts_mtime: float):
     """One row per cluster: what has been decided, what the AI said, what you've marked.
 
     Underscore-prefixed args are excluded from Streamlit's cache key; the mtimes are what
@@ -209,6 +236,7 @@ def cluster_overview(_cfg, _clusters, _name: str, _db_mtime: float, _ins_mtime: 
     review = I.load_cohort_review(_cfg)
     flagged = set(I.flagged_clusters(review))
     annotations = S.all_annotations(_cfg)
+    counts = D.load_cell_counts(_cfg)
     rows = []
     for c in _clusters:
         a = annotations.get(c, {})
@@ -216,6 +244,8 @@ def cluster_overview(_cfg, _clusters, _name: str, _db_mtime: float, _ins_mtime: 
         reann = I.load_reannotation(_cfg, c)
         rows.append({
             "cluster": c,
+            "ncells": a.get("ncells") if a.get("ncells") is not None
+            else counts.get(c, {}).get("ncells"),
             "reviewed": bool(a.get("reviewed")),
             "label": a.get("annot_type") or "",
             "abbrev": a.get("annot_abbrev") or "",
@@ -264,27 +294,287 @@ def img_with_download(png_path: str, caption: str, key: str, width: int | None =
                        file_name=Path(png_path).name, mime="image/png", key=key)
 
 
-def keyboard_nav():
-    """Inject a keydown listener so ←/→ click the Prev/Next feature-plot buttons.
+# Every shortcut works by clicking a real button, so the key and the click go through exactly the
+# same code path and a shortcut cannot drift from what the button does. (key, label, what it does) —
+# this list is both the JS keymap and the on-screen legend, so they cannot disagree.
+SHORTCUTS = [
+    ("ArrowLeft",  "←",     "fp_prev",     "Previous feature plot"),
+    ("ArrowRight", "→",     "fp_next",     "Next feature plot"),
+    ("[",          "[",     "cl_prev",     "Previous cluster"),
+    ("]",          "]",     "cl_next",     "Next cluster"),
+    ("u",          "u",     "next_unrev",  "Jump to the next unreviewed cluster"),
+]
 
-    Ignores key events while a text field is focused so typing (e.g. the config path)
-    isn't hijacked. Re-injected each run; replaces the prior listener to avoid stacking.
+
+def keyboard_nav(sections: list[str]):
+    """Inject one keydown listener that clicks the button behind each shortcut.
+
+    Digits 1-9 and 0 select the 1st-10th section via the hidden buttons in the shortcuts expander.
+    Ignores key events while a text field is focused, so typing a label or a config path isn't
+    hijacked. Re-injected each run; replaces the prior listener rather than stacking another.
     """
-    inject_js("""
+    keymap = {k: f".st-key-{key} button" for k, _, key, _ in SHORTCUTS}
+    for i, _ in enumerate(sections[:10]):
+        keymap[str((i + 1) % 10)] = f".st-key-sec_{i} button"
+    inject_js(f"""
 const doc = window.parent.document, w = window.parent;
-if (w.__fpNav) doc.removeEventListener('keydown', w.__fpNav);
-w.__fpNav = function(e){
+const keymap = {json.dumps(keymap)};
+if (w.__kbNav) doc.removeEventListener('keydown', w.__kbNav);
+w.__kbNav = function(e){{
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   const t = e.target, tag = t && t.tagName ? t.tagName.toUpperCase() : '';
   if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable)) return;
-  let sel = null;
-  if (e.key === 'ArrowLeft') sel = '.st-key-fp_prev button';
-  else if (e.key === 'ArrowRight') sel = '.st-key-fp_next button';
-  else return;
+  const sel = keymap[e.key];
+  if (!sel) return;
   const el = doc.querySelector(sel);
-  if (el && !el.disabled) { e.preventDefault(); el.click(); }
-};
-doc.addEventListener('keydown', w.__fpNav);
+  if (el && !el.disabled) {{ e.preventDefault(); el.click(); }}
+}};
+doc.addEventListener('keydown', w.__kbNav);
 """)
+
+
+def shortcut_key(sections: list[str], section: str):
+    """The on-screen legend, plus the hidden buttons the digit shortcuts click.
+
+    A key press has to land on a real widget, so each digit gets a button. They are hidden with CSS
+    rather than tucked inside the collapsed expander: Streamlit marks a closed expander's contents
+    `inert`, and an inert element may ignore a synthetic click — which would make the shortcuts work
+    only while the legend happened to be open.
+    """
+    with st.sidebar.expander("⌨️ Keyboard shortcuts"):
+        st.markdown("\n".join(f"- **{shown}** — {what}" for _, shown, _, what in SHORTCUTS))
+        st.markdown("- **1**…**9**, **0** — jump to a section:\n"
+                    + "\n".join(f"    - **{(i + 1) % 10}** {name}"
+                                + ("  ← here" if name == section else "")
+                                for i, name in enumerate(sections[:10])))
+        st.caption("Shortcuts are ignored while you're typing in a field. Streamlit's own "
+                   "**C** = clear cache is disabled here, since that would discard paid AI work.")
+    for i, name in enumerate(sections[:10]):
+        st.sidebar.button(name, key=f"sec_{i}", on_click=_go_to_section, args=(name,))
+    hidden = ", ".join(f".st-key-sec_{i}" for i in range(len(sections[:10])))
+    st.html(f"<style>{hidden} {{ display: none; }}</style>")
+
+
+def _go_to_section(name: str):
+    st.session_state["section_pick"] = name
+    st.session_state["section_last"] = name
+
+
+# --------------------------------------------------------------- annotation of record
+def tsv_pref_keys(cfg) -> tuple[str, str]:
+    """Pref keys for the TSV path and the auto-write flag — per dataset, since the path is."""
+    return f"tsv_path:{cfg['name']}", f"tsv_auto:{cfg['name']}"
+
+
+def current_tsv_path(cfg) -> str:
+    """The configured TSV target: what you last typed in the export panel, else `output_tsv:` from
+    the YAML, else a dated default beside the annotation DB."""
+    pk, _ = tsv_pref_keys(cfg)
+    return str(D.load_prefs().get(pk) or E.tsv_path(cfg))
+
+
+def tsv_auto_on(cfg) -> bool:
+    """Whether saving an annotation also rewrites the TSV. Defaults on when the dataset config
+    names an `output_tsv:` — asking for the file is asking for it to be kept current."""
+    _, ak = tsv_pref_keys(cfg)
+    return bool(D.load_prefs().get(ak, bool(cfg.get("output_tsv"))))
+
+
+def write_tsv_now(cfg, only_annotated: bool | None = None, quiet: bool = False):
+    """Write the TSV to the configured path. Never raises: a save must not be lost to a bad path.
+
+    only_annotated=None follows the Export panel's "Include unlabelled clusters" toggle, so the
+    file a save rewrites has the same shape as one written by the button.
+    """
+    if only_annotated is None:
+        only_annotated = not st.session_state.get("exp_all", False)
+    try:
+        path, n = E.write_tsv(cfg, st.session_state.clusters, st.session_state.genes,
+                              st.session_state.motifs, out_path=current_tsv_path(cfg),
+                              only_annotated=only_annotated)
+        if not quiet:
+            st.toast(f"Wrote {n} row(s) to {Path(path).name}")
+        return path, n
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Could not write the TSV: {exc}")
+        return None, 0
+
+
+def sidebar_annotation(cfg, cluster: int, counts: dict):
+    """The annotation form itself — in the sidebar, so it stays reachable from every section.
+
+    Everything in the main pane is evidence; this is where a decision gets written down. It lives
+    beside the evidence rather than in a section of its own so you can type the label while looking
+    at the marker table or the spatial projection that justifies it. The AI annotation is offered as
+    a prefill: a first draft to accept or edit, not something to read in one pane and retype here.
+    """
+    a = S.get_annotation(cfg, cluster)
+    sugg = E.suggest_from_insight(cfg, cluster)
+    n = counts.get(cluster, {})
+
+    with st.sidebar.expander(f"✍️ Annotation — cluster {cluster}", expanded=True):
+        if sugg:
+            # Buttons inside st.form only submit, so the prefill lives outside it: it writes the
+            # widgets' session_state and reruns, and session_state takes precedence over `value=`.
+            if st.button("↙ Prefill from AI", width="stretch", key="an_prefill",
+                         help=f"AI proposes: {sugg.get('annot_type', '—')}. Copies it and its "
+                              "PMIDs into the form. Nothing is saved until you press Save."):
+                for k, v in sugg.items():
+                    st.session_state[f"an_{k}_{cluster}"] = v
+                st.rerun()
+
+        with st.form(f"annot_form_{cluster}"):
+            vals = {
+                "annot_type": st.text_input(
+                    "annot_type — full label", value=a.get("annot_type") or "",
+                    key=f"an_annot_type_{cluster}", placeholder="Forebrain progenitors"),
+                "annot_abbrev": st.text_input(
+                    "annot_abbrev — short label", value=a.get("annot_abbrev") or "",
+                    key=f"an_annot_abbrev_{cluster}", placeholder="Fb"),
+                "annot_origin": st.text_input(
+                    "annot_origin — germ layer / lineage", value=a.get("annot_origin") or "",
+                    key=f"an_annot_origin_{cluster}", placeholder="Ectoderm"),
+                "reference_omg_type": st.text_input(
+                    "reference_omg_type — matching atlas type",
+                    value=a.get("reference_omg_type") or "",
+                    key=f"an_reference_omg_type_{cluster}", placeholder="Telencephalon"),
+                "annot_trajectory": st.text_input(
+                    "annot_trajectory", value=a.get("annot_trajectory") or "",
+                    key=f"an_annot_trajectory_{cluster}", placeholder="-"),
+                "annot_order": st.number_input(
+                    "annot_order — figure order", min_value=0, step=1,
+                    value=int(a["annot_order"]) if a.get("annot_order") is not None else 0,
+                    key=f"an_annot_order_{cluster}",
+                    help="0 = unset; unnumbered clusters sort to the end of the export."),
+                "refs": st.text_input(
+                    "refs", value=a.get("refs") or "", key=f"an_refs_{cluster}",
+                    placeholder="PMIDs:26371318,25820448"),
+                # Prefilled from the counts computed off the Seurat object; a saved value wins.
+                "ncells": st.number_input(
+                    "ncells", min_value=0, step=1,
+                    value=int(a.get("ncells") if a.get("ncells") is not None
+                              else n.get("ncells") or 0),
+                    key=f"an_ncells_{cluster}",
+                    help="0 = unset. Prefilled from the Seurat object when available."),
+                "pct_cells": st.number_input(
+                    "%cells", min_value=0.0, max_value=1.0, step=0.0001, format="%.6f",
+                    value=float(a.get("pct_cells") if a.get("pct_cells") is not None
+                                else n.get("pct_cells") or 0.0),
+                    key=f"an_pct_cells_{cluster}",
+                    help="Fraction, not percent (0.0508 = 5.08%). Prefilled from the object."),
+            }
+            reviewed = st.checkbox("Mark this cluster reviewed", value=bool(a.get("reviewed")),
+                                   key=f"an_reviewed_{cluster}")
+            if st.form_submit_button("💾 Save annotation", type="primary", width="stretch"):
+                # 0 is the "unset" sentinel for the numeric fields — store NULL so the export
+                # leaves the cell blank rather than asserting a real zero.
+                clean = dict(vals)
+                for k in ("annot_order", "ncells"):
+                    clean[k] = int(clean[k]) or None
+                clean["pct_cells"] = float(clean["pct_cells"]) or None
+                S.set_annotation(cfg, cluster, clean, reviewed=reviewed)
+                st.toast(f"Annotation saved for cluster {cluster}")
+                if tsv_auto_on(cfg):
+                    write_tsv_now(cfg)
+        if n:
+            st.caption(f"Object says cluster {cluster} has **{n['ncells']:,}** cells "
+                       f"({n['pct_cells'] * 100:.2f}%).")
+        stars_g = len(S.selected_markers(cfg, cluster, "gene"))
+        stars_m = len(S.selected_markers(cfg, cluster, "motif"))
+        st.caption(f"★ {stars_g} gene(s), ★ {stars_m} motif(s), "
+                   f"💬 {S.comment_count(cfg, cluster)} note(s) on this cluster. "
+                   "The ★ markers and these notes fill the remaining export columns.")
+
+
+def cell_counts_panel(cfg, clusters):
+    """What ncells / %cells were computed from, and a way to redo it."""
+    st.markdown("### Cells per cluster")
+    counts = st.session_state.get("cell_counts") or {}
+    meta = D.cell_counts_meta(cfg)
+    cc = D.cell_counts_cfg(cfg)
+    if counts:
+        total = meta.get("total_cells") or sum(v["ncells"] for v in counts.values())
+        src = (f"`{Path(str(meta['object'])).name}` · column `{meta['cluster_column']}`"
+               if meta.get("object") else f"`{D.cell_counts_path(cfg)}`")
+        st.caption(f"**{total:,}** cells over {len(counts)} clusters, from {src}"
+                   + (f" · computed {meta['generated_at']}" if meta.get("generated_at") else "")
+                   + ". These prefill `ncells` / `%cells`; anything you type in the form wins.")
+        missing = [c for c in clusters if c not in counts]
+        if missing:
+            st.warning(f"No count for cluster(s) {missing} — the cluster ids in the object and in "
+                       "the marker tables don't line up completely.")
+    elif cc["seurat_object"]:
+        st.caption(f"Not counted yet, from `{cc['seurat_object']}`."
+                   + ("" if cc["auto"] else " `cell_counts.auto` is off, so loading won't do it — "
+                                            "use the button below or `./run_app.sh counts`."))
+    else:
+        st.caption("No Seurat object configured, so `ncells` / `%cells` are yours to type. Set "
+                   "`cell_counts.seurat_object` (or `seurat_object`) in the dataset config to have "
+                   "them counted, or point `cell_counts.tsv` at a table you already have.")
+    if cc["seurat_object"] and not cc["tsv"] and st.button(
+            "↻ Recount from the Seurat object",
+            help="Reads the object again — tens of seconds and several GB. Needed only if the "
+                 "object or its clustering changed."):
+        load_cell_counts(cfg, force=True)
+        st.rerun()
+
+
+def export_panel(cfg, clusters, genes, motifs):
+    """xlsx and TSV export. Sits with the all-clusters view: exporting is a whole-dataset action."""
+    st.markdown("### Export")
+    done = S.annotated_clusters(cfg)
+    st.caption(f"{len(done)} of {len(clusters)} clusters have a label. Both formats carry the same "
+               "13 columns as the annotation template.")
+    only_annotated = not st.toggle(
+        "Include unlabelled clusters", key="exp_all",
+        help="Off: only clusters with a label. On: every cluster, so you can see what is "
+             "still outstanding.")
+
+    xl, tsv = st.columns(2)
+    with xl:
+        if st.button("⤓ Build xlsx export", width="stretch", type="primary"):
+            try:
+                path, n = E.write_xlsx(cfg, clusters, genes, motifs, only_annotated=only_annotated)
+                st.session_state["export_path"] = str(path)
+                st.success(f"Wrote {n} row(s) to `{path}`")
+            except Exception as exc:
+                st.error(f"Export failed: {exc}")
+        saved = st.session_state.get("export_path")
+        if saved and Path(saved).exists():
+            st.download_button("⤓ Download the xlsx", _file_bytes(saved, os.path.getmtime(saved)),
+                               file_name=Path(saved).name, key="dl_xlsx", width="stretch",
+                               mime="application/vnd.openxmlformats-officedocument."
+                                    "spreadsheetml.sheet")
+    with tsv:
+        pk, ak = tsv_pref_keys(cfg)
+        path_str = st.text_input("Output TSV", value=current_tsv_path(cfg), key="tsv_path_in",
+                                 help="Written in place each time — a fixed path a downstream "
+                                      "script can keep reading. Set `output_tsv:` in the dataset "
+                                      "config to make it the default.")
+        auto = st.toggle("Rewrite it on every save", value=tsv_auto_on(cfg), key="tsv_auto_in",
+                         help="Keeps the file in step with the annotation DB, so you never have "
+                              "to remember to export.")
+        if (path_str, auto) != (current_tsv_path(cfg), tsv_auto_on(cfg)):
+            D.save_prefs({pk: path_str, ak: auto})
+        if st.button("⤓ Write TSV now", width="stretch"):
+            path, n = write_tsv_now(cfg, only_annotated=only_annotated, quiet=True)
+            if path:
+                st.success(f"Wrote {n} row(s) to `{path}`")
+        existing = Path(current_tsv_path(cfg))
+        if existing.exists():
+            st.caption("Last written "
+                       f"{pd.Timestamp.fromtimestamp(existing.stat().st_mtime):%Y-%m-%d %H:%M}")
+            st.download_button("⤓ Download the TSV",
+                               _file_bytes(str(existing), os.path.getmtime(existing)),
+                               file_name=existing.name, key="dl_tsv", width="stretch",
+                               mime="text/tab-separated-values")
+
+    with st.expander("Preview the export"):
+        st.dataframe(E.build_table(cfg, clusters, genes, motifs, only_annotated=only_annotated),
+                     hide_index=True, width="stretch")
+        st.caption("`key_marker_genes` / `select_marker_motifs` come from the **★** stars on the "
+                   "marker tables, `comments` from your notes, and `ncells` / `%cells` from the "
+                   "Seurat object unless you typed your own.")
 
 
 # --------------------------------------------------------------- sidebar
@@ -339,12 +629,28 @@ _labels = {int(r.cluster): cluster_label(r) for r in _ov.itertuples()}
 cluster = st.sidebar.selectbox("Cluster", clusters, index=0,
                               format_func=lambda c: _labels.get(c, str(c)), key="cluster_pick")
 
+
+def _step_cluster(delta: int):
+    """Walk the cluster list, wrapping. A callback so the selectbox follows before the rerun."""
+    cur = clusters.index(st.session_state.get("cluster_pick", clusters[0]))
+    st.session_state["cluster_pick"] = clusters[(cur + delta) % len(clusters)]
+
+
+_cp, _cn = st.sidebar.columns(2)
+_cp.button("◀ Cluster", key="cl_prev", on_click=_step_cluster, args=(-1,), width="stretch")
+_cn.button("Cluster ▶", key="cl_next", on_click=_step_cluster, args=(1,), width="stretch")
+
 _todo = [int(r.cluster) for r in _ov.itertuples() if not r.reviewed]
-if _todo and st.sidebar.button(f"⏭ Next unreviewed ({len(_todo)} left)", width="stretch",
-                               help="Jump to the lowest-numbered cluster not yet marked reviewed."):
-    nxt = next((c for c in _todo if c > cluster), _todo[0])
-    st.session_state["cluster_pick"] = nxt
-    st.rerun()
+if _todo:
+    def _next_unreviewed():
+        st.session_state["cluster_pick"] = next((c for c in _todo if c > cluster), _todo[0])
+
+    st.sidebar.button(f"⏭ Next unreviewed ({len(_todo)} left)", width="stretch", key="next_unrev",
+                      on_click=_next_unreviewed,
+                      help="Jump to the lowest-numbered cluster not yet marked reviewed.")
+
+# The annotation of record — in the sidebar so it can be filled in while browsing any section.
+sidebar_annotation(cfg, cluster, st.session_state.get("cell_counts") or {})
 
 # Per-cluster notes (stored in the SQLite annotation DB; shown in the Comments tab).
 with st.sidebar.form("note_form", clear_on_submit=True):
@@ -366,24 +672,44 @@ disp_w = st.sidebar.slider("Max image width (px)", 400, 1600, int(_prefs.get("di
 if (render_dpi, disp_w) != (_prefs.get("render_dpi"), _prefs.get("disp_w")):
     D.save_prefs({"render_dpi": render_dpi, "disp_w": disp_w})
 
-# AI insights model override (session-only; the YAML holds the persistent default).
-_aic = D.ai_insights_cfg(cfg)
+# Model choice: remembered per dataset in .run/ui_prefs.json, so it survives a browser refresh,
+# a second tab, and an app restart. It used to live in session_state only, which meant a reload
+# silently reverted to the YAML default — you would pick Opus 5, refresh, and spend on the old
+# model without anything on screen disagreeing with you.
+_aic = D.ai_insights_cfg(cfg)             # YAML values, before any override
+_model_prefs = D.load_prefs()
+_pm_key, _fm_key = f"ai_primary:{cfg['name']}", f"ai_fallback:{cfg['name']}"
+_opts = list(dict.fromkeys(
+    D.KNOWN_MODELS + [_aic["primary_model"], _aic["fallback_model"],
+                      _model_prefs.get(_pm_key), _model_prefs.get(_fm_key)]))
+_opts = [m for m in _opts if m]
+# Seed the widgets from prefs once per session and let `key=` carry them afterwards. Passing both
+# `index=` and `key=` makes Streamlit warn that one of them is being ignored — the ambiguity that
+# made this control look broken.
+for _k, _stored, _yaml_val in ((("ai_primary", _model_prefs.get(_pm_key), _aic["primary_model"])),
+                               (("ai_fallback", _model_prefs.get(_fm_key), _aic["fallback_model"]))):
+    if st.session_state.get(_k) not in _opts:
+        st.session_state[_k] = _stored if _stored in _opts else _yaml_val
+
 with st.sidebar.expander("AI insights — models"):
-    _opts = list(dict.fromkeys(D.KNOWN_MODELS + [_aic["primary_model"], _aic["fallback_model"]]))
-    _pm = st.selectbox("Primary model", _opts, index=_opts.index(_aic["primary_model"]),
-                       key="ai_primary")
-    _fm = st.selectbox("Fallback model", _opts, index=_opts.index(_aic["fallback_model"]),
-                       key="ai_fallback")
+    _pm = st.selectbox("Primary model", _opts, key="ai_primary")
+    _fm = st.selectbox("Fallback model", _opts, key="ai_fallback")
     _workers = st.slider("Parallel clusters (workers)", 1, 16, int(_aic["max_workers"]), 1,
                          help="Clusters generated concurrently. Higher = faster up to your API "
                               "rate limits (the SDK auto-retries throttling); ~8-10 is a good ceiling.")
-    cfg.setdefault("ai_insights", {})
-    cfg["ai_insights"]["primary_model"] = _pm
-    cfg["ai_insights"]["fallback_model"] = _fm
-    cfg["ai_insights"]["max_workers"] = _workers
-    st.caption("Session override. Switch **Primary** to Fable 5 (or another mythos-class model) once "
-               "its safeguards relax, then **Regenerate** in the AI insights tab. Changing the model "
-               "marks cached insights stale; they refresh only when you regenerate (never on load).")
+    if (_pm, _fm) != (_model_prefs.get(_pm_key), _model_prefs.get(_fm_key)):
+        D.save_prefs({_pm_key: _pm, _fm_key: _fm})
+    st.caption(
+        f"Remembered for **{cfg['name']}** (the YAML default is `{_aic['primary_model']}`). The "
+        "**AI insights** tab shows what the next run will use. Changing a model marks cached "
+        "annotations stale — they refresh only when you regenerate, never on load.")
+
+# The override the rest of the app reads. Written onto the loaded config so every insights call
+# picks it up, since they all resolve models through D.ai_insights_cfg(cfg).
+cfg.setdefault("ai_insights", {})
+cfg["ai_insights"]["primary_model"] = _pm
+cfg["ai_insights"]["fallback_model"] = _fm
+cfg["ai_insights"]["max_workers"] = _workers
 
 cache_imgs = D.cache_dir(cfg) / "img"
 
@@ -463,7 +789,6 @@ def feature_stepper(kind: str, width: int):
     png = P.render_page(pdf, page, render_dpi, cache_imgs)
     img_with_download(png, f"Cluster {cluster} · {kind} · {feat} (page {page})",
                       key=f"dl_{kind}", width=width)
-    keyboard_nav()
 
 
 # --------------------------------------------------------------- main tabs
@@ -564,114 +889,6 @@ def render_cohort(rev: dict):
     st.caption(usage_line(meta))
 
 
-# --------------------------------------------------------------- annotation of record
-def annotation_panel(cfg, cluster: int, clusters, genes, motifs):
-    """The form where the user records the actual annotation, plus the xlsx export.
-
-    Everything above this in the app is evidence; this is where a decision gets written down. The
-    AI annotation is offered as a prefill so it acts as a first draft to accept or edit, rather
-    than something to read in one pane and retype in another.
-    """
-    a = S.get_annotation(cfg, cluster)
-    sugg = E.suggest_from_insight(cfg, cluster)
-
-    c1, c2 = st.columns([1, 2])
-    if sugg:
-        # Buttons inside st.form only submit, so the prefill lives outside it: it writes the
-        # widgets' session_state and reruns, and session_state takes precedence over `value=`.
-        if c1.button("↙ Prefill from AI annotation", width="stretch",
-                     help="Copies the AI cell-type call and its PMIDs into the form below. "
-                          "Nothing is saved until you press Save."):
-            for k, v in sugg.items():
-                st.session_state[f"an_{k}_{cluster}"] = v
-            st.rerun()
-        c2.caption(f"AI proposes: **{sugg.get('annot_type', '—')}**"
-                   + (f" · {sugg.get('refs')}" if sugg.get("refs") else " · no anchored PMIDs"))
-    else:
-        c1.caption("No AI annotation for this cluster yet — nothing to prefill from.")
-
-    with st.form(f"annot_form_{cluster}"):
-        f1, f2 = st.columns(2)
-        vals = {
-            "annot_type": f1.text_input(
-                "annot_type — full label", value=a.get("annot_type") or "",
-                key=f"an_annot_type_{cluster}", placeholder="Forebrain progenitors"),
-            "annot_abbrev": f2.text_input(
-                "annot_abbrev — short label", value=a.get("annot_abbrev") or "",
-                key=f"an_annot_abbrev_{cluster}", placeholder="Fb"),
-            "annot_origin": f1.text_input(
-                "annot_origin — germ layer / lineage", value=a.get("annot_origin") or "",
-                key=f"an_annot_origin_{cluster}", placeholder="Ectoderm"),
-            "reference_omg_type": f2.text_input(
-                "reference_omg_type — matching atlas type",
-                value=a.get("reference_omg_type") or "",
-                key=f"an_reference_omg_type_{cluster}", placeholder="Telencephalon"),
-            "annot_trajectory": f1.text_input(
-                "annot_trajectory", value=a.get("annot_trajectory") or "",
-                key=f"an_annot_trajectory_{cluster}", placeholder="-"),
-            "annot_order": f2.number_input(
-                "annot_order — figure order", min_value=0, step=1,
-                value=int(a["annot_order"]) if a.get("annot_order") is not None else 0,
-                key=f"an_annot_order_{cluster}",
-                help="0 = unset; unnumbered clusters sort to the end of the export."),
-            "refs": st.text_input(
-                "refs", value=a.get("refs") or "", key=f"an_refs_{cluster}",
-                placeholder="PMIDs:26371318,25820448"),
-            "ncells": f1.number_input(
-                "ncells", min_value=0, step=1,
-                value=int(a["ncells"]) if a.get("ncells") is not None else 0,
-                key=f"an_ncells_{cluster}", help="0 = unset."),
-            "pct_cells": f2.number_input(
-                "%cells", min_value=0.0, max_value=1.0, step=0.0001, format="%.6f",
-                value=float(a["pct_cells"]) if a.get("pct_cells") is not None else 0.0,
-                key=f"an_pct_cells_{cluster}", help="Fraction, not percent (0.0508 = 5.08%)."),
-        }
-        reviewed = st.checkbox("Mark this cluster reviewed", value=bool(a.get("reviewed")),
-                               key=f"an_reviewed_{cluster}")
-        if st.form_submit_button("💾 Save annotation", type="primary", width="stretch"):
-            # 0 is the "unset" sentinel for the numeric fields — store NULL so the export leaves
-            # the cell blank rather than asserting a real zero.
-            clean = dict(vals)
-            for k in ("annot_order", "ncells"):
-                clean[k] = int(clean[k]) or None
-            clean["pct_cells"] = float(clean["pct_cells"]) or None
-            S.set_annotation(cfg, cluster, clean, reviewed=reviewed)
-            st.toast(f"Annotation saved for cluster {cluster}")
-
-    st.caption("`key_marker_genes` and `select_marker_motifs` are not typed here — they come from "
-               "the **★** stars on the marker tables. `comments` comes from your sidebar notes.")
-    stars_g = len(S.selected_markers(cfg, cluster, "gene"))
-    stars_m = len(S.selected_markers(cfg, cluster, "motif"))
-    st.caption(f"This cluster: ★ {stars_g} gene(s), ★ {stars_m} motif(s), "
-               f"💬 {S.comment_count(cfg, cluster)} note(s).")
-
-    st.divider()
-    st.markdown("### Export")
-    done = S.annotated_clusters(cfg)
-    st.caption(f"{len(done)} of {len(clusters)} clusters have a label. "
-               f"Export writes the 13-column sheet matching `{Path(cfg.get('annotation_template', 'the E9 template')).name}`.")
-    ec1, ec2 = st.columns([1, 1])
-    only_annotated = not ec2.toggle("Include unlabelled clusters", key="exp_all",
-                                    help="Off: only clusters with a label. On: every cluster, "
-                                         "so you can see what is still outstanding.")
-    if ec1.button("⤓ Build xlsx export", width="stretch", type="primary"):
-        try:
-            path, n = E.write_xlsx(cfg, clusters, genes, motifs, only_annotated=only_annotated)
-            st.session_state["export_path"] = str(path)
-            st.success(f"Wrote {n} row(s) to `{path}`")
-        except Exception as exc:
-            st.error(f"Export failed: {exc}")
-    saved = st.session_state.get("export_path")
-    if saved and Path(saved).exists():
-        st.download_button("⤓ Download the xlsx", _file_bytes(saved, os.path.getmtime(saved)),
-                           file_name=Path(saved).name, key="dl_xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with st.expander("Preview the export"):
-            st.dataframe(E.build_table(cfg, clusters, genes, motifs,
-                                       only_annotated=only_annotated),
-                         hide_index=True, width="stretch")
-
-
 # --------------------------------------------------------------- all-clusters overview
 def overview_panel(cfg, clusters, overview):
     """The cross-cluster view: progress at a glance, plus search over the AI annotations.
@@ -709,12 +926,15 @@ def overview_panel(cfg, clusters, overview):
         st.caption(f"{len(view)} cluster(s) mention “{q.strip()}”"
                    + (" — nothing matched" if view.empty else ""))
 
-    show = ["cluster", "reviewed", "label", "abbrev", "order", "ai_identity", "conf",
+    show = ["cluster", "ncells", "reviewed", "label", "abbrev", "order", "ai_identity", "conf",
             "flagged", "reannotated", "reann_stale", "stars_gene", "stars_motif", "notes",
             "refs", "cost"]
     st.dataframe(
         view[show], hide_index=True, width="stretch",
         column_config={
+            "ncells": st.column_config.NumberColumn(
+                "cells", format="%d",
+                help="Cells in the cluster, from the Seurat object (or what you typed)"),
             "reviewed": st.column_config.CheckboxColumn("✓", help="Marked reviewed"),
             "flagged": st.column_config.CheckboxColumn("🚩", help="Cohort review flagged it"),
             "reannotated": st.column_config.CheckboxColumn("↻", help="Has a reannotation"),
@@ -730,28 +950,37 @@ def overview_panel(cfg, clusters, overview):
             "cost": st.column_config.NumberColumn("$", format="%.3f",
                                                   help="Recorded AI spend for this cluster"),
         })
-    st.caption("Read-only. Edit a cluster's label in the **Annotation** section; the ★ counts come "
-               "from the marker tables.")
+    st.caption("Read-only. Edit a cluster's label in the sidebar's **✍️ Annotation** form; the ★ "
+               "counts come from the marker tables.")
 
 
 st.header(f"Cluster {cluster}")
-SECTIONS = ["Annotation", "All clusters", "Marker genes", "Marker motifs", "Spatial (Tangram)",
-            "UMAP highlight", "Feature plots", "Other annotations", "AI insights",
-            "Cohort review", "Comments"]
-# Lazy sections: only the selected section's code runs per rerun. st.tabs would execute ALL nine
+# Ordered the way a cluster is actually worked through: where is it (UMAP, spatial), what does it
+# express (feature plots, markers), what else is known (other annotations), what does the AI think,
+# then the cross-cluster views. The annotation form itself is in the sidebar, reachable from all of
+# them.
+SECTIONS = ["UMAP highlight", "Spatial (Tangram)", "Feature plots", "Marker genes",
+            "Marker motifs", "Other annotations", "AI insights", "Cohort review", "Comments",
+            "All clusters"]
+# Lazy sections: only the selected section's code runs per rerun. st.tabs would execute ALL ten
 # bodies every rerun (re-rendering the 26 MB Tangram, feature plots, etc. on every interaction) —
 # the main cause of the freezing. segmented_control looks/behaves like a tab bar.
-section = st.segmented_control("Section", SECTIONS, default=SECTIONS[0],
-                               key="section_pick", label_visibility="collapsed")
+# Seeded through session_state rather than `default=`, because the shortcut buttons write that
+# key — passing both makes Streamlit warn that the default is being ignored.
+st.session_state.setdefault("section_pick", SECTIONS[0])
+section = st.segmented_control("Section", SECTIONS, key="section_pick",
+                               label_visibility="collapsed")
 if section is None:  # clicking the active chip deselects it; keep the last section, like tabs
     section = st.session_state.get("section_last", SECTIONS[0])
 st.session_state["section_last"] = section
+shortcut_key(SECTIONS, section)   # sidebar legend + the buttons the digit keys click
 
-if section == "Annotation":
-    annotation_panel(cfg, cluster, clusters, st.session_state.genes, st.session_state.motifs)
-
-elif section == "All clusters":
+if section == "All clusters":
     overview_panel(cfg, clusters, _ov)
+    st.divider()
+    cell_counts_panel(cfg, clusters)
+    st.divider()
+    export_panel(cfg, clusters, st.session_state.genes, st.session_state.motifs)
 
 elif section == "Marker genes":
     marker_panel("gene")
@@ -819,6 +1048,19 @@ elif section == "AI insights":
         genes_df, motifs_df = st.session_state.genes, st.session_state.motifs
         st.caption("Generation makes **paid** API calls — each action below asks you to confirm, and "
                    "any current annotation is backed up before it's overwritten.")
+        # State the models and the output ceiling here, at the point of spending: a run that used a
+        # model you didn't intend, or truncated against a low max_tokens, is only obvious afterwards.
+        _pricing = "" if I.price_for(aic["primary_model"]) else "  ⚠️ no list price on file — cost will be understated"
+        st.caption(
+            f"🤖 Next run uses **{aic['primary_model']}** (fallback `{aic['fallback_model']}`, "
+            f"structuring `{aic['structuring_model']}`) · effort `{aic['effort']}` · "
+            f"max_tokens `{aic['max_tokens']:,}`. Change the models in the sidebar.{_pricing}")
+        if aic["max_tokens"] < 16000:
+            st.warning(
+                f"`max_tokens` is {aic['max_tokens']:,} for this dataset. A search-heavy call can "
+                "spend that entire budget on thinking and web search and get truncated before it "
+                "writes any analysis — which is what a *'truncated at max_tokens'* failure means. "
+                "Raise `ai_insights.max_tokens` to 32000 in the dataset config.")
         st.caption(f"💰 {I.format_dataset_cost(cfg, clusters)}")
 
         # In primer mode the dataset's reference sheet is the prerequisite for every per-cluster
@@ -946,8 +1188,8 @@ elif section == "AI insights":
                     for k, v in vals.items():          # keep the open form in sync
                         st.session_state[f"an_{k}_{cluster}"] = v
                     st.success(f"Saved as the annotation for cluster {cluster}: "
-                               f"**{vals.get('annot_type', '')}**. Refine it in the "
-                               "**Annotation** section.")
+                               f"**{vals.get('annot_type', '')}**. Refine it in the sidebar's "
+                               "**✍️ Annotation** form.")
                 else:
                     st.warning("Nothing to copy from this reannotation.")
             _cur = S.get_annotation(cfg, cluster).get("annot_type")
@@ -1016,3 +1258,7 @@ elif section == "Comments":
                 S.delete_comment(cfg, r["id"])
                 st.rerun()
             st.divider()
+
+
+# One keydown listener for the whole app, injected last so every button it targets exists.
+keyboard_nav(SECTIONS)

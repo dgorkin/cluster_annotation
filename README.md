@@ -13,7 +13,7 @@ configured by a single YAML file.
 ## 1. Install
 
 You need **Python 3.11** (via conda) and **R** (for `Rscript`, used once per dataset to export the
-marker tables).
+marker tables and count cells per cluster — base R only, no Seurat needed).
 
 ```bash
 git clone <this-repo> cluster_annotation
@@ -62,7 +62,7 @@ Copy the template and edit the paths:
 cp config/dataset.template.yaml config/mydataset.yaml
 ```
 
-You need five things:
+You need a handful of things:
 
 | Field | What it is |
 |---|---|
@@ -71,6 +71,7 @@ You need five things:
 | `motif_markers_rds` | The same for motifs (uses `avg_diff` instead of `avg_log2FC`) |
 | `tangram_pdf` | Optional. Spatial projection PDF, one page per cluster |
 | `*_featureplot_glob` | Per-cluster feature-plot PDFs, with `{cluster}` where the cluster id goes |
+| `cell_counts.seurat_object` | Optional. The Seurat object the clusters came from, read once to fill in `ncells` and `%cells` |
 | `biological_context` | **The most important field.** Describe the sample in prose — species, developmental stage, tissue, assay, caveats. Everything the AI produces is built on this, so be specific. |
 
 The marker `.rds` files are expected to be a length-1 list wrapping a `FindAllMarkers` data frame
@@ -123,28 +124,59 @@ The first load of a new dataset runs `Rscript` to export the marker tables to `.
 That takes a minute; subsequent loads are instant. Use **Re-preprocess** if the source `.rds`
 files change.
 
+If you configured a Seurat object, the first load also counts cells per cluster — a whole-embryo
+multiome takes tens of seconds and several GB of RAM, once, cached to
+`.cache/<name>/cluster_cells.tsv`. To get it out of the way before you open the app:
+
+```bash
+./run_app.sh counts config/mydataset.yaml     # --force to redo it
+```
+
+Which metadata column holds the cluster ids is worked out by matching them against the marker
+tables — the column whose values *are* your cluster ids. If several match (a resolution sweep
+usually leaves duplicates) they agree by definition and the conventional name is recorded. If none
+match, nothing is guessed: you get an error listing the candidates, and you name the column with
+`cell_counts.cluster_column`. Numbers you type into the form always win over the counted ones.
+
 ---
 
 ## 4. Annotate
 
-Pick a cluster in the sidebar, then work through the sections:
+Pick a cluster in the sidebar. The **✍️ Annotation** form is in the sidebar too, so you can type
+the label while looking at whichever evidence justifies it — it doesn't go away when you change
+section. Sections run left to right in the order you'd normally work through a cluster:
 
 | Section | Use |
 |---|---|
-| **Annotation** | Where you record the decision, and where you export from |
-| **All clusters** | Progress across the whole dataset, plus search over the AI annotations |
+| **UMAP highlight** | Where the cluster sits in the embedding |
+| **Spatial (Tangram)** | Where it maps onto the reference tissue |
+| **Feature plots** | Marker expression, one plot at a time. Step with **◀ ▶** or the **← →** arrow keys |
 | **Marker genes / motifs** | Sortable marker tables. Tick **★** on the markers that convinced you — these become the `key_marker_genes` / `select_marker_motifs` columns in the export |
-| **Spatial / UMAP / Feature plots** | The images. Feature plots step with **◀ ▶** or the **← →** arrow keys |
 | **Other annotations** | Any extra per-cluster PDFs you configured (label transfers, QC overlays) |
 | **AI insights** | Claude's cited hypothesis for this cluster |
 | **Cohort review** | A whole-dataset critique: likely over-split clusters, inconsistencies, expected cell types that are missing |
 | **Comments** | Free-text notes, kept per cluster |
+| **All clusters** | Progress across the whole dataset, search over the AI annotations, and the export |
 
 The cluster picker shows state as you go — `12 ✓ Forebrain progenitors 🚩 ★4 💬2` — so you can see
 what's done, what's flagged, and what's untouched. **Next unreviewed** jumps to the next gap.
 
 Your notes, stars and annotations live in `annotations/<name>.sqlite`. That file is your work —
 **back it up**; it is not regenerable.
+
+### Keyboard shortcuts
+
+The sidebar's **⌨️ Keyboard shortcuts** expander is the reference; in short:
+
+| Key | Does |
+|---|---|
+| **←** / **→** | Previous / next feature plot |
+| **[** / **]** | Previous / next cluster |
+| **u** | Jump to the next unreviewed cluster |
+| **1**…**9**, **0** | Jump to the 1st…10th section |
+
+All of them are ignored while you're typing in a field. Streamlit's own **C** = clear cache is
+disabled, since that would discard paid AI work.
 
 ---
 
@@ -194,7 +226,13 @@ Knobs in the config, if you need them:
 - `research_mode` — `primer` (default) or `per_cluster`, which gives every cluster its own
   literature search: much slower and dearer, occasionally better on an unusual dataset
 - `num_references` — how many citations per cluster
-- `primary_model` / `fallback_model` — the fallback is used automatically if the primary declines
+- `primary_model` / `fallback_model` — default `claude-opus-5` with `claude-opus-4-8` behind it;
+  the fallback is used automatically if the primary declines, and each annotation's footer names the
+  model that actually served it. You can also pick models in the sidebar (**AI insights — models**);
+  that choice is remembered per dataset and overrides the YAML.
+- `max_tokens` — the ceiling for one call, covering thinking, web search *and* the written
+  analysis. Keep it at 32000: a search-heavy literature call can spend a small budget entirely on
+  searching and fail with *"truncated at max_tokens … before writing the analysis"*.
 
 Regenerating overwrites an annotation, but the previous version is always copied to
 `.cache/<name>/ai_insights/_backups/` first.
@@ -203,15 +241,23 @@ Regenerating overwrites an annotation, but the previous version is always copied
 
 ## 6. Export
 
-In the **Annotation** section, **Prefill from AI annotation** copies the AI's cell-type call and
-its PMIDs into the form — then edit it into your own words. The AI output is a first draft, not
-the answer.
+In the sidebar form, **↙ Prefill from AI** copies the AI's cell-type call and its PMIDs into the
+fields — then edit it into your own words. The AI output is a first draft, not the answer.
 
-**Build xlsx export** writes a spreadsheet to `annotations/`. Columns come from three places:
+Export lives in **All clusters**, in two formats with identical content:
 
-- the annotation form (labels, origin, figure order, references, cell counts)
+- **Build xlsx export** — a dated spreadsheet in `annotations/`, for reading and sharing.
+- **Write TSV** — a plain table at a path you choose. Unlike the xlsx it is rewritten *in place*,
+  so a downstream script can keep reading the same file. Set `output_tsv:` in the dataset config to
+  fix the path (`{name}` and `{date}` are substituted), and leave **Rewrite it on every save** on to
+  have it kept in step with every annotation you save — no remembering to export.
+
+The 13 columns come from four places:
+
+- the annotation form (labels, origin, figure order, references)
 - your **★** starred markers (`key_marker_genes`, `select_marker_motifs`)
-- your sidebar notes (`comments`)
+- your notes (`comments`)
+- the Seurat object (`ncells`, `%cells`) unless you typed your own
 
 Rows come out in the `annot_order` you assigned, with unnumbered clusters last. By default only
 clusters you've labelled are included; toggle that to see what's outstanding.
@@ -228,7 +274,11 @@ clusters you've labelled are included; toggle that to see what's outstanding.
 | Feature plot labels don't match the images | The `featureplot:` block doesn't match the ordering your plotting script used |
 | AI sections say no API key | Check the secrets file path and that it contains `ANTHROPIC_API_KEY=` |
 | `APITimeoutError` during generation | A research call is exceeding the HTTP timeout. Confirm nothing has changed the research call away from streaming |
+| "truncated at max_tokens … before writing the analysis" | `ai_insights.max_tokens` is too low for a search-heavy call — raise it to 32000. `doctor` warns below 16000 |
+| A run used a model you didn't pick | Check the **AI insights** tab: it states the models, effort and ceiling the next run will use. The sidebar choice is per dataset |
 | Two datasets overwriting each other | They share a `name:` — it drives the cache directory |
+| "Could not identify the cluster column" | The object's metadata has no column matching your cluster ids. Set `cell_counts.cluster_column`, or `cell_counts.tsv` to supply the counts directly |
+| `ncells` / `%cells` blank in the export | No Seurat object configured, or its counting failed — `./run_app.sh doctor` says which |
 | Everything reads as needing regeneration after an upgrade | The prompt version changed, so old annotations aren't comparable to new ones. They still display; only the "needs regeneration" flag changed |
 
 Run the offline test suites any time — they need no API key and no network:
@@ -245,9 +295,11 @@ for t in tests/test_*.py; do ~/.conda/envs/cluster_annotation/bin/python $t; don
 config/dataset.template.yaml   copy this per dataset
 app/                           app.py (UI), data.py, pdf.py, insights.py (AI), store.py, export.py
 preprocess/export_markers.R    RDS -> marker tables + feature-plot page index
+preprocess/export_cell_counts.R  Seurat object -> cells per cluster (base R; no Seurat needed)
 scripts/generate_all.py        build primer + annotate every cluster + cohort review
 scripts/reannotate_flagged.py  escalate specific clusters to their own literature search
 scripts/doctor.py              preflight checks (./run_app.sh doctor)
+scripts/cell_counts.py         count cells per cluster ahead of time (./run_app.sh counts)
 tests/                         offline tests, no API key needed
 .cache/<name>/                 derived data + AI annotations (regenerable)
 annotations/<name>.sqlite       YOUR notes, stars and annotations — back this up

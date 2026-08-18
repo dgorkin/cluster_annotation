@@ -12,6 +12,7 @@
 #   ./run_app.sh restart [PORT]
 #   ./run_app.sh logs             follow the app log
 #   ./run_app.sh doctor           preflight: env, Rscript, config inputs, secrets permissions
+#   ./run_app.sh counts [CONFIG]  count cells per cluster from the Seurat object (--force to redo)
 #
 # PORT is a starting point, not a requirement: if it is taken (a stale instance, another user on
 # this shared box) the next free port is used and reported. Default 8501.
@@ -172,6 +173,7 @@ case "${1:-start}" in
     status)         cmd_status ;;
     logs)           tail -f "$LOG_FILE" ;;
     doctor)         require_env; exec "$PY" scripts/doctor.py "${@:2}" ;;
+    counts)         require_env; exec "$PY" scripts/cell_counts.py "${@:2}" ;;
     # Print the header comment block as the help text, stopping at the first non-comment line so
     # it cannot drift out of sync when the header grows.
     -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0" ;;
