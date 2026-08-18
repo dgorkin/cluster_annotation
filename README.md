@@ -176,7 +176,9 @@ The sidebar's **⌨️ Keyboard shortcuts** expander is the reference; in short:
 | **1**…**9**, **0** | Jump to the 1st…10th section |
 
 All of them are ignored while you're typing in a field. Streamlit's own **C** = clear cache is
-disabled, since that would discard paid AI work.
+disabled, since that would discard paid AI work. The expander also shows whether the key listener
+is live (`⌨️ keyboard listener: active`) — if it ever says *not detected*, the browser-side script
+didn't run and the keys will do nothing.
 
 ---
 
@@ -287,6 +289,7 @@ clusters you've labelled are included; toggle that to see what's outstanding.
 | A run used a model you didn't pick | Check the **AI insights** tab: it states the models, effort and ceiling the next run will use. The sidebar choice is per dataset |
 | Not sure whether a build is still running | The sidebar shows an indicator whenever paid work is in flight, from any section; **AI insights** has the full banner. Status lives in `.cache/<name>/jobs/`, so it survives reloads |
 | A job says `interrupted` | The app was restarted while it ran. Whatever it finished writing was kept — re-run to complete the rest |
+| Keyboard shortcuts do nothing | Open **⌨️ Keyboard shortcuts** in the sidebar: if it says *not detected*, the injected script failed to run (`tests/test_injected_js.py` covers this) |
 | Two datasets overwriting each other | They share a `name:` — it drives the cache directory |
 | "Could not identify the cluster column" | The object's metadata has no column matching your cluster ids. Set `cell_counts.cluster_column`, or `cell_counts.tsv` to supply the counts directly |
 | `ncells` / `%cells` blank in the export | No Seurat object configured, or its counting failed — `./run_app.sh doctor` says which |

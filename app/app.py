@@ -33,8 +33,16 @@ def inject_js(script: str) -> None:
     instead of inside a zero-height iframe, so there is no wasted layout box. The scripts below
     still address the document via `window.parent` — correct either way, because at top level
     window.parent is window itself.
+
+    **The IIFE wrapper is load-bearing.** Injecting inline means every script shares one global
+    lexical scope, so two scripts that both declare `const doc` — or the same script re-injected on
+    the next rerun — is a *parse-time* SyntaxError that silently kills the whole script, listeners
+    and all. That is exactly what happened when this moved off the iframe (which gave each script
+    its own document): the keyboard shortcuts never registered, with nothing in the UI to say so.
+    Wrapping here rather than in each caller means a new script cannot reintroduce the bug.
     """
-    st.html(f"<script>{script}</script>", unsafe_allow_javascript=True)
+    st.html("<script>(function(){\n" + script + "\n})();</script>",
+            unsafe_allow_javascript=True)
 
 
 def block_clear_cache_shortcut():
@@ -439,6 +447,12 @@ w.__kbNav = function(e){{
   if (el && !el.disabled) {{ e.preventDefault(); el.click(); }}
 }};
 doc.addEventListener('keydown', w.__kbNav);
+const mark = function(){{
+  const el = doc.getElementById('kb-status');
+  if (el) el.textContent = '⌨️ keyboard listener: active';
+}};
+mark();
+w.requestAnimationFrame(mark);   // the badge may mount just after this script runs
 """)
 
 
@@ -458,6 +472,10 @@ def shortcut_key(sections: list[str], section: str):
                                 for i, name in enumerate(sections[:10])))
         st.caption("Shortcuts are ignored while you're typing in a field. Streamlit's own "
                    "**C** = clear cache is disabled here, since that would discard paid AI work.")
+        # Rewritten to "active" by the injected listener. If the injection ever breaks again, this
+        # says so instead of the keys just quietly doing nothing.
+        st.html('<span id="kb-status" style="font-size:0.8em;opacity:0.7">'
+                '⌨️ keyboard listener: not detected</span>')
     for i, name in enumerate(sections[:10]):
         st.sidebar.button(name, key=f"sec_{i}", on_click=_go_to_section, args=(name,))
     hidden = ", ".join(f".st-key-sec_{i}" for i in range(len(sections[:10])))
