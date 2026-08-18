@@ -1,0 +1,32 @@
+.venv/
+.cache/
+__pycache__/
+*.pyc
+# Never commit secrets (the real key lives outside the repo in ~/.config/cluster_annotation/).
+*.env
+secrets.env
+# User annotation data (comments + starred markers/plots). Yours to back up; not source.
+annotations/
+# Run output from scripts/generate_all.py and scripts/reannotate_flagged.py.
+logs/
+# Snapshots of the (paid, but regenerable) .cache/*/ai_insights artifacts — backups, not source.
+ai_insights_backups/
+# Large source binaries. The symlinks under inputs/ ARE tracked (they document the data layout);
+# these two are real multi-MB files that belong outside git.
+ref_materials/*.pptx
+inputs/spatial/*.pdf
+# Launcher runtime state (pidfile, port).
+.run/
+
+# --- Lab-specific, kept out of the shared repo (see scripts/prepare_for_sharing.sh) ---
+# Real dataset configs hold absolute paths into unpublished project directories.
+config/*.yaml
+!config/dataset.template.yaml
+# Symlinks to source data; machine-specific and point at the same paths.
+inputs/
+# Annotation spreadsheets from unpublished work.
+ref_materials/
+# This project's own planning notes and development history.
+INITIAL_PLAN.MD
+INITIAL_PLAN_ANSWERS.MD
+docs/DESIGN_NOTES.md

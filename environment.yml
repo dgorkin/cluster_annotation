@@ -1,0 +1,19 @@
+# Conda spec for the cluster-annotation browser.
+#
+#   conda env create -f environment.yml          # creates `cluster_annotation`
+#   ./run_app.sh doctor                          # verify
+#
+# The python deps come through pip rather than conda channels because that is how the working env
+# was actually built, and mixing the two for these packages tends to resolve differently.
+# Versions are pinned in requirements.txt.
+#
+# Rscript is NOT installed here — preprocess/export_markers.R uses the system R (4.1.2 on this
+# host) and the marker RDS files are read with base R plus data.frame handling only.
+name: cluster_annotation
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.txt

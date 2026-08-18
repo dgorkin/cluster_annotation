@@ -1,0 +1,114 @@
+# ============================================================================
+# Dataset configuration template — copy this per dataset and edit the paths.
+#
+#     cp config/dataset.template.yaml config/mydataset.yaml
+#     ./run_app.sh doctor config/mydataset.yaml     # verify before launching
+#
+# Paths may be absolute, or relative to the project root.
+# `{cluster}` is replaced with the cluster id (0..N) for per-cluster filenames.
+# ============================================================================
+
+# Short identifier for this dataset. Drives the cache directory (.cache/<name>/), the annotation
+# database (annotations/<name>.sqlite) and the export filename.
+# MUST be unique per dataset — two configs sharing a name will overwrite each other's results.
+name: CHANGE_ME
+
+# Free-form; shown in the sidebar. Handy when you keep several clustering resolutions around.
+resolution: CHANGE_ME        # e.g. 0.8 — free-form label, shown in the sidebar
+
+# ---------------------------------------------------------------- marker tables (required)
+# Seurat FindAllMarkers() output saved with saveRDS(). Expected as a length-1 list wrapping the
+# data frame. Genes may carry the feature in rownames; motifs in a `gene` column — both work.
+# Motif tables use `avg_diff` where gene tables use `avg_log2FC`.
+markers_rds:        /CHANGE/ME/all_markers.rds
+motif_markers_rds:  /CHANGE/ME/all_markers_motifs.rds
+
+# ---------------------------------------------------------------- images (optional but useful)
+# Spatial projection PDF: one page per cluster. Pages do NOT have to be in numeric order — the
+# page for each cluster is found by reading the "Cluster N" text on it.
+tangram_pdf:        /CHANGE/ME/spatial_cluster_overlays.pdf   # delete this line if you have none
+
+# Per-cluster feature-plot PDFs. Page 1 must be the UMAP highlight for that cluster; later pages
+# are one marker each.
+gene_featureplot_glob:  /CHANGE/ME/plots/cluster_{cluster}_marker_gene_featureplots.pdf
+motif_featureplot_glob: /CHANGE/ME/plots/cluster_{cluster}_marker_motif_featureplots.pdf
+
+# Any extra per-cluster PDFs to browse alongside — label transfers, QC overlays, scoring plots.
+# One page per cluster, in sorted-cluster order (page 1 = the lowest cluster id).
+# Delete or comment out if you have none.
+other_annotations: []
+#  - name: "label transfer"
+#    pdf: /CHANGE/ME/plots/label_transfer_bycluster.pdf
+
+# ---------------------------------------------------------------- feature-plot page ordering
+# The feature-plot PDFs are images with no extractable text, so page -> marker-name labels are
+# reconstructed from the marker tables. This block must MIRROR THE PLOTTING SCRIPT that made the
+# PDFs; if it doesn't, the app will show the wrong marker name next to a plot.
+#
+# The defaults below describe: for genes, two top-N lists (by effect size, then by pct.1) joined
+# with a separator gene and de-duplicated; for motifs, a single top-N list by effect size.
+featureplot:
+  gene:
+    topn: 20
+    sort_primary:   [p_val_adj, avg_log2FC]   # avg_log2FC descending
+    sort_secondary: [p_val_adj, pct.1]        # pct.1 descending
+    separator: null                           # the gene your script plotted between the two
+                                              # lists, e.g. a housekeeping gene; null if none
+  motif:
+    topn: 30
+    sort_primary: [p_val_adj, avg_diff]       # single list, no separator
+    separator: null
+
+# ---------------------------------------------------------------- biological context (important)
+# Describe the sample in prose: species, developmental stage or age, tissue, assay, and any
+# caveats. This is the foundation for everything the AI produces — the reference sheet it builds,
+# the cell types it expects, and the literature it looks for. Vague context gives vague results.
+biological_context: |
+  CHANGE ME. Describe the sample in a few sentences, covering:
+    - species and strain
+    - developmental stage or age
+    - tissue or region, and how it was dissected
+    - assay (e.g. single-cell RNA, single-nucleus multiome)
+    - caveats: mixed ages or genotypes, uncertain dissection boundaries, known contamination
+  Be specific. The reference sheet, the cell types considered, and the literature
+  searched are all derived from what you write here.
+
+# ---------------------------------------------------------------- AI annotation
+# Nothing here spends money on its own: generation is always button-initiated and confirmed.
+ai_insights:
+  enabled: true
+  auto_generate_on_load: false     # keep false — never spend just because a page loaded
+
+  # primer      = one literature-search call builds a dataset reference sheet, then each cluster is
+  #               annotated against it and cites BY KEY into its verified library. Fast and cheap,
+  #               and a citation that isn't in the library cannot reach your output.
+  # per_cluster = every cluster does its own literature search. Much slower and dearer; occasionally
+  #               better on an unusual dataset the primer struggles to cover.
+  research_mode: primer
+
+  primary_model:     claude-opus-5
+  fallback_model:    claude-opus-4-8   # used automatically if the primary declines
+  structuring_model: claude-haiku-4-5  # mechanical reformatting only
+
+  effort: high                     # low | medium | high — lower is cheaper and shallower
+  top_n_genes: 30                  # markers shown to the model per cluster
+  top_n_motifs: 30
+  num_references: 5                # citations per cluster
+
+  # Searches per call. null = uncapped, which matters for the primer since every cluster's
+  # citations come out of it. Only applies to calls that search (the primer, and per_cluster mode).
+  web_search_max_uses: null
+
+  prompt_caching: true             # re-read context bills at ~0.1x; leave on
+  max_workers: 8                   # clusters annotated concurrently
+  max_tokens: 32000                # output ceiling per call (thinking + tools + the analysis)
+
+  # Read at runtime and passed straight to the API — never committed, logged or put on a command
+  # line. Create it with chmod 600. See the README.
+  api_key_file: ~/.config/cluster_annotation/secrets.env
+
+# Where derived data and AI annotations go. Regenerable; safe to delete.
+cache_dir: .cache
+
+# Where YOUR annotations live (annotations/<name>.sqlite). Not regenerable — back it up.
+annotations_dir: annotations

@@ -1,0 +1,18 @@
+# Python deps for the cluster-annotation browser, pinned to what the working
+# `cluster_annotation` conda env actually had on 2026-08-17.
+#
+# Install into a dedicated conda env (never system/base python):
+#   conda create -y -n cluster_annotation python=3.11
+#   ~/.conda/envs/cluster_annotation/bin/pip install -r requirements.txt
+#
+# Then verify with:  ./run_app.sh doctor
+#
+# Note R is a separate, non-pip dependency: preprocess/export_markers.R needs Rscript on PATH to
+# export the marker RDS files. `doctor` checks for it.
+streamlit==1.58.0
+PyMuPDF==1.27.2.3
+pandas==3.0.3
+PyYAML==6.0.3
+openpyxl==3.1.5
+anthropic==0.109.1
+pydantic==2.13.4
